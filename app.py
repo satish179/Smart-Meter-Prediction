@@ -201,6 +201,99 @@ def seed_demo_live_history(num_points=120):
     power = np.clip(baseline + noise, 0.05, None)
     return pd.DataFrame({'Time': times, 'Power': np.round(power, 3)})
 
+def apply_quick_range(frame, quick_range, custom_range=None):
+    if frame.empty:
+        return frame.copy()
+    now = pd.Timestamp.now()
+    if quick_range == "24H":
+        return frame.loc[frame.index >= (now - pd.Timedelta(hours=24))]
+    if quick_range == "7D":
+        return frame.loc[frame.index >= (now - pd.Timedelta(days=7))]
+    if quick_range == "30D":
+        return frame.loc[frame.index >= (now - pd.Timedelta(days=30))]
+    if quick_range == "Custom" and custom_range and len(custom_range) == 2:
+        start_date, end_date = custom_range
+        mask = (frame.index.date >= start_date) & (frame.index.date <= end_date)
+        return frame.loc[mask]
+    return frame.copy()
+
+def build_forecast_dataframe(raw_predictions, history_df):
+    pred_df = pd.DataFrame(raw_predictions).copy()
+    if pred_df.empty:
+        return pred_df
+    pred_df['time'] = pd.to_datetime(pred_df['time'], errors='coerce')
+    pred_df = pred_df.dropna(subset=['time', 'kwh'])
+    pred_df['kwh'] = pd.to_numeric(pred_df['kwh'], errors='coerce').clip(lower=0)
+    pred_df = pred_df.dropna(subset=['kwh']).sort_values('time').reset_index(drop=True)
+    baseline_std = float(history_df['energy_kwh'].tail(24 * 14).std()) if not history_df.empty else 0.05
+    sigma = max(0.05, baseline_std * 0.25)
+    horizon_scale = np.sqrt(np.arange(1, len(pred_df) + 1) / max(1, len(pred_df)))
+    band = sigma * (0.7 + 0.6 * horizon_scale)
+    pred_df['min_kwh'] = np.maximum(0, pred_df['kwh'] - band)
+    pred_df['max_kwh'] = pred_df['kwh'] + band
+    width = np.maximum(1e-6, pred_df['max_kwh'] - pred_df['min_kwh'])
+    pred_df['confidence_pct'] = np.clip(100 - ((width / np.maximum(pred_df['kwh'], 0.05)) * 100), 35, 98)
+    return pred_df
+
+def generate_action_recommendations(current_kwh, forecast_df):
+    actions = []
+    if current_kwh > 0.65:
+        actions.append("Current load is high. Shift heavy appliances to late morning or afternoon.")
+    elif current_kwh > 0.35:
+        actions.append("Usage is moderate. Avoid stacking HVAC and water heating in the same hour.")
+    else:
+        actions.append("Usage is efficient right now. This is a good window for discretionary loads.")
+    if forecast_df is not None and not forecast_df.empty:
+        peak_row = forecast_df.loc[forecast_df['kwh'].idxmax()]
+        actions.append(
+            f"Peak demand expected around {peak_row['time'].strftime('%I:%M %p')}. "
+            "Pre-cool or pre-heat before this period."
+        )
+    actions.append("Enable anomaly alerts and review the History tab daily for recurring spikes.")
+    return actions
+
+def build_alert_table(history_df, forecast_df, live_alerts):
+    rows = []
+    if not history_df.empty:
+        rolling = history_df['energy_kwh'].rolling(24, min_periods=12)
+        baseline = rolling.mean().fillna(history_df['energy_kwh'].mean())
+        std = rolling.std().fillna(history_df['energy_kwh'].std()).replace(0, np.nan).fillna(0.05)
+        z = (history_df['energy_kwh'] - baseline) / std
+        abnormal = history_df[z > 2.5].tail(10)
+        for ts, val in abnormal['energy_kwh'].items():
+            rows.append({
+                'time': pd.Timestamp(ts),
+                'severity': 'High' if val > history_df['energy_kwh'].quantile(0.95) else 'Medium',
+                'issue': 'Unexpected usage spike',
+                'impact': f"{val:.2f} kWh in one interval",
+                'action': 'Check concurrent HVAC/heater/EV load and reschedule non-critical usage.'
+            })
+    if forecast_df is not None and not forecast_df.empty:
+        peak = forecast_df['kwh'].max()
+        avg = forecast_df['kwh'].mean()
+        if peak > avg * 1.35:
+            peak_row = forecast_df.loc[forecast_df['kwh'].idxmax()]
+            rows.append({
+                'time': peak_row['time'],
+                'severity': 'Medium',
+                'issue': 'Forecasted peak period',
+                'impact': f"Expected peak {peak:.2f} kWh",
+                'action': 'Move high-power activities to lower-demand hours.'
+            })
+    for raw in live_alerts[:8]:
+        rows.append({
+            'time': pd.Timestamp.now(),
+            'severity': 'High',
+            'issue': raw,
+            'impact': 'Real-time anomaly trigger',
+            'action': 'Inspect active devices and reduce load immediately if not intentional.'
+        })
+    if not rows:
+        return pd.DataFrame(columns=['time', 'severity', 'issue', 'impact', 'action', 'status'])
+    alert_df = pd.DataFrame(rows).drop_duplicates(subset=['issue', 'impact']).sort_values('time', ascending=False)
+    alert_df['status'] = 'Open'
+    return alert_df.reset_index(drop=True)
+
 @st.cache_resource
 def init_system():
     predictor = EnergyPredictor()
@@ -270,7 +363,7 @@ except Exception as e:
 with st.sidebar:
     st.image("https://img.icons8.com/fluency/96/lightning-bolt.png", width=60)
     st.title("Lumina")
-    st.caption("Energy Intelligence This Month")
+    st.caption("Simple Energy Monitoring")
     st.divider()
 
     st.subheader("System Status")
@@ -292,16 +385,16 @@ with st.sidebar:
         pass 
 
     st.session_state.quick_demo_mode = st.toggle(
-        "Quick Demo Mode",
+        "Demo Mode",
         value=st.session_state.quick_demo_mode,
-        help="One-click demo setup: fills a sample location and preloads forecast/live visuals."
+        help="One-click setup with sample location and seeded visuals."
     )
     if st.session_state.quick_demo_mode and not st.session_state.location:
         st.session_state.location = "Bengaluru"
     if not st.session_state.quick_demo_mode:
         st.session_state.demo_bootstrapped = False
 
-    st.markdown("**📍 Location**")
+    st.markdown("**Location**")
 
 
     # Enforce Precise Location (GPS)
@@ -331,7 +424,7 @@ with st.sidebar:
     
     with col_loc2:
         # Button merely triggers rerun, allowing get_geolocation to fire again if needed
-        st.button("📍", help="Refresh GPS Location")
+        st.button("Refresh", help="Refresh GPS Location")
     
 
 
@@ -359,34 +452,28 @@ with st.sidebar:
             st.caption(f"Wind: {float(live_weather.get('WindSpeed', 0)):.2f} m/s")
 
     st.divider()
-    st.subheader("View")
-    st.markdown("**⚙️ Configuration**")
+    st.subheader("Preferences")
     cost_per_kwh = st.slider("Tariff ($/kWh)", 0.05, 0.50, 0.15, 0.01)
-    compact_mode = st.toggle("Compact Layout", value=False, help="Tighter spacing for small screens.")
+    compact_mode = st.toggle("Compact Layout", value=False, help="Use tighter spacing.")
     show_explanations = st.toggle("Show Smart Explanations", value=False, help="Show lightweight plain-language summaries across tabs.")
     
     st.divider()
     
-    # --- LUMINA AI ASSISTANT ---
-    st.subheader("Assistant")
-    st.markdown("**💬 Ask Lumina**")
-    
-    if "chat_history" not in st.session_state:
-        st.session_state.chat_history = []
+    with st.expander("Assistant", expanded=False):
+        if "chat_history" not in st.session_state:
+            st.session_state.chat_history = []
 
-    user_query = st.text_input("Question:", placeholder="Why is my bill high?", key="chat_input")
-    
-    if st.button("Ask", key="chat_btn") and user_query:
-        # Instantiate Chatbot (lazy load)
-        bot = EnergyChatbot(df, current_cost_kwh=cost_per_kwh)
-        response = bot.get_response(user_query)
-        st.session_state.chat_history.insert(0, {"user": user_query, "bot": response})
-        
-    if st.session_state.chat_history:
-        for chat in st.session_state.chat_history[:3]:
-             st.markdown(f"**You:** {chat['user']}")
-             st.markdown(f"**Lumina:** {chat['bot']}")
-             st.divider()
+        user_query = st.text_input("Question", placeholder="Why is my bill high?", key="chat_input")
+        if st.button("Ask", key="chat_btn") and user_query:
+            bot = EnergyChatbot(df, current_cost_kwh=cost_per_kwh)
+            response = bot.get_response(user_query)
+            st.session_state.chat_history.insert(0, {"user": user_query, "bot": response})
+
+        if st.session_state.chat_history:
+            for chat in st.session_state.chat_history[:2]:
+                st.markdown(f"**You:** {chat['user']}")
+                st.markdown(f"**Lumina:** {chat['bot']}")
+                st.divider()
     
 if compact_mode:
     st.markdown("""
@@ -533,204 +620,297 @@ card(col4, "Daily Average", f"{avg_daily:.1f}", "kWh")
 st.write("") # Spacer
 
 # --- 6. Tabs Content ---
-tab_main, tab_sim, tab_live, tab_forecast, tab_solar = st.tabs(
-    ["Overview", "What-If Lab", "Live Telemetry", "Forecast", "Solar Planner"]
+tab_dashboard, tab_history, tab_prediction, tab_alerts, tab_live, tab_solar, tab_advanced = st.tabs(
+    ["Dashboard", "History", "Forecast", "Alerts", "Live", "Solar", "Advanced"]
 )
 
-with tab_main:
-    st.subheader("Consumption Analysis")
-    
-    # Logic for aggregation
-    # Logic for aggregation
-    # If using "Today" with live data, we want high resolution (no daily resampling)
-    if len(filtered_df) < 2000: # Increased threshold to accommodate live data seconds
-        chart_data = filtered_df.reset_index()
-        # Ensure we have a consistent name for time
-        if 'index' in chart_data.columns:
-            chart_data = chart_data.rename(columns={'index': 'Timestamp'})
-        
-        x_axis = 'Timestamp:T' 
-        tooltip_format = '%d %b %H:%M:%S'
-        threshold = filtered_df['energy_kwh'].mean() + (1.5 * filtered_df['energy_kwh'].std())
-    else:
-        chart_data = filtered_df['energy_kwh'].resample('D').sum().reset_index()
-        # Resample reset_index might name it 'Timestamp' or 'index' depending on original index name
-        chart_data.columns = ['Timestamp', 'energy_kwh'] # Force consistent naming
-        
-        x_axis = 'Timestamp:T' 
-        tooltip_format = '%d %b'
-        threshold = chart_data['energy_kwh'].mean() + chart_data['energy_kwh'].std()
+if 'forecast_df' not in st.session_state:
+    st.session_state.forecast_df = pd.DataFrame()
+if 'alerts' not in st.session_state:
+    st.session_state.alerts = []
+if 'alert_acknowledged' not in st.session_state:
+    st.session_state.alert_acknowledged = False
 
-    # --- PROFESSIONAL CHART ---
-    base = alt.Chart(chart_data).encode(
-        x=alt.X(x_axis, title='Timestamp', axis=alt.Axis(grid=False)),
-        y=alt.Y('energy_kwh:Q', title='Energy (kWh)'),
-        tooltip=[alt.Tooltip(x_axis, format=tooltip_format), 'energy_kwh']
-    )
+forecast_overlay = st.session_state.forecast_df.copy() if not st.session_state.forecast_df.empty else pd.DataFrame()
+current_kwh = float(filtered_df['energy_kwh'].iloc[-1]) if not filtered_df.empty else 0.0
+current_cost_hour = current_kwh * cost_per_kwh
+status_text = "Normal"
+if not filtered_df.empty:
+    if current_kwh > filtered_df['energy_kwh'].quantile(0.9):
+        status_text = "High Usage"
+    elif current_kwh > filtered_df['energy_kwh'].quantile(0.7):
+        status_text = "Elevated"
 
-    # 1. Clean Area
-    area = base.mark_area(
-        line={'color':'#3b82f6'},
-        color=alt.Gradient(
-            gradient='linear',
-            stops=[alt.GradientStop(color='#3b82f6', offset=0),
-                   alt.GradientStop(color='rgba(59, 130, 246, 0.1)', offset=1)],
-            x1=1, x2=1, y1=1, y2=0
+with tab_dashboard:
+    st.subheader("Dashboard")
+    show_forecast_overlay = st.toggle("Show forecast overlay", value=True, key="dashboard_show_forecast")
+    dashboard_df = apply_quick_range(df, "24H")
+
+    today_start = pd.Timestamp.now().normalize()
+    yesterday_start = today_start - pd.Timedelta(days=1)
+    today_data = df[df.index >= today_start] if not df.empty else pd.DataFrame()
+    yesterday_data = df[(df.index >= yesterday_start) & (df.index < today_start)] if not df.empty else pd.DataFrame()
+    today_total = float(today_data['energy_kwh'].sum()) if not today_data.empty else 0.0
+    yesterday_total = float(yesterday_data['energy_kwh'].sum()) if not yesterday_data.empty else 0.0
+    today_delta = (today_total - yesterday_total) if yesterday_total > 0 else None
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Current Usage", f"{current_kwh:.3f} kWh")
+    c2.metric("Today Total", f"{today_total:.2f} kWh", delta=f"{today_delta:+.2f} vs yesterday" if today_delta is not None else None)
+    c3.metric("Estimated Cost Today", f"${today_total * cost_per_kwh:.2f}")
+
+    if not dashboard_df.empty:
+        plot_df = dashboard_df[['energy_kwh']].copy().sort_index().reset_index().rename(columns={'index': 'Timestamp'})
+        actual = alt.Chart(plot_df).mark_area(
+            line={'color': '#3b82f6'},
+            color=alt.Gradient(
+                gradient='linear',
+                stops=[
+                    alt.GradientStop(color='#3b82f6', offset=0),
+                    alt.GradientStop(color='rgba(59, 130, 246, 0.12)', offset=1)
+                ],
+                x1=1, x2=1, y1=1, y2=0
+            )
+        ).encode(
+            x=alt.X('Timestamp:T', title='Time'),
+            y=alt.Y('energy_kwh:Q', title='Energy (kWh)'),
+            tooltip=[alt.Tooltip('Timestamp:T', format='%d %b %H:%M'), alt.Tooltip('energy_kwh:Q', format='.3f')]
         )
-    )
-    
-    # 2. Red Dots (Retained as requested)
-    points = base.mark_circle(size=60, opacity=0.8).encode(
-        color=alt.condition(
-            alt.datum.energy_kwh > threshold,
-            alt.value('#ef4444'),  # Professional Red
-            alt.value('transparent')
-        ),
-        tooltip=[alt.Tooltip(x_axis, format=tooltip_format), 'energy_kwh']
-    )
-    
-    final_chart = (area + points).interactive().properties(height=350).configure_axis(
-        labelColor='#9ca3af',
-        titleColor='#9ca3af'
-    ).configure_view(strokeWidth=0)
-    
-    st.altair_chart(final_chart, use_container_width=True)
-    
-    # --- HEATMAP RESTORED ---
-    st.divider()
-    st.subheader("Hourly Intensity Heatmap")
-    
-    heatmap_data = filtered_df.copy()
-    heatmap_data['Hour'] = heatmap_data.index.hour
-    
-    heatmap = alt.Chart(heatmap_data.groupby(['Hour'])['energy_kwh'].mean().reset_index()).mark_rect().encode(
-        x=alt.X('Hour:O', title='Hour of Day'),
-        y=alt.Y('energy_kwh:Q', title='Avg kWh'),
-        color=alt.Color('energy_kwh', scale=alt.Scale(scheme='blues'), title='kWh'),
-        tooltip=['Hour', 'energy_kwh']
-    ).interactive().properties(height=200).configure_axis(
-        labelColor='#9ca3af', titleColor='#9ca3af'
-    )
-    
-    st.altair_chart(heatmap, use_container_width=True)
-    if show_explanations:
-        if chart_data.empty:
-            st.caption("Insight: No data is available in this range yet.")
-        else:
-            peak_idx = chart_data['energy_kwh'].idxmax()
-            trough_idx = chart_data['energy_kwh'].idxmin()
-            peak_row = chart_data.loc[peak_idx]
-            low_row = chart_data.loc[trough_idx]
-            st.caption(
-                f"Insight: Average usage is {chart_data['energy_kwh'].mean():.2f} kWh. "
-                f"Peak near {peak_row['Timestamp']} ({peak_row['energy_kwh']:.2f} kWh), "
-                f"low near {low_row['Timestamp']} ({low_row['energy_kwh']:.2f} kWh)."
+        layers = actual
+        if show_forecast_overlay and not forecast_overlay.empty:
+            fc = forecast_overlay.copy()
+            fc['time'] = pd.to_datetime(fc['time'], errors='coerce')
+            fc = fc.dropna(subset=['time', 'kwh'])
+            forecast_line = alt.Chart(fc).mark_line(color='#f59e0b', strokeDash=[5, 4], strokeWidth=2.2).encode(
+                x=alt.X('time:T'),
+                y=alt.Y('kwh:Q'),
+                tooltip=[alt.Tooltip('time:T', format='%d %b %H:%M'), alt.Tooltip('kwh:Q', format='.3f')]
             )
-            with st.expander("More details", expanded=False):
-                st.write(
-                    f"Red markers indicate values above the dynamic threshold ({threshold:.2f} kWh), "
-                    f"which generally corresponds to peak-demand periods."
-                )
-
-with tab_sim:
-    st.subheader("Scenario Simulator")
-    if 'last_sim_result' not in st.session_state:
-        st.session_state.last_sim_result = None
-    
-    if city_name:
-        live_sim_weather = get_live_weather(city_name)
-        default_temp = float(live_sim_weather['Temperature'])
-        default_hum = int(live_sim_weather['Humidity'])
+            layers = actual + forecast_line
+        st.altair_chart(layers.interactive().properties(height=340), use_container_width=True)
     else:
-        default_temp = 25.0
-        default_hum = 50
-    
-    # --- NEW SIMULATOR LAYOUT ---
-    sim_col1, sim_col2 = st.columns([1, 1])
-    
-    with sim_col1:
-        st.markdown("#### Environmental Factors")
-        st.info("Adjust outside conditions to test efficient responses.")
-        sim_temp = st.slider("Outside Temperature (°C)", 0.0, 50.0, default_temp)
-        sim_hum = st.slider("Humidity (%)", 0, 100, default_hum)
-        
-    with sim_col2:
-        st.markdown("#### Time & Usage")
-        st.info("Set the time context for the simulation.")
-        sim_hour = st.slider("Hour of Day (0-23)", 0, 23, 18)
-        sim_is_weekend = st.toggle("Weekend Mode", value=False)
-        sim_occupancy = st.select_slider("Occupancy Level", options=["Low", "Medium", "High"], value="Medium")
-    
-    st.write("---")
-    
-    if st.button("Run Scenario Analysis", type="primary"):
-        sim_time = datetime.datetime.now().replace(hour=sim_hour, minute=0, second=0)
-        
-        # Adjust for weekend
-        if not sim_is_weekend:
-            while sim_time.weekday() >= 5:
-                sim_time -= datetime.timedelta(days=1)
-        
-        # Occupancy multiplier (Simple logic enhancement)
-        occ_mult = {"Low": 0.8, "Medium": 1.0, "High": 1.3}
-        
-        weather = {
-            'Temperature': sim_temp,
-            'Humidity': sim_hum,
-            'Pressure': 1013,
-            'WindSpeed': 5,
-            'Voltage': 230.0,
-            'Current': 2.0,
-            'Frequency': 50.0
-        }
-        
-        # Predict
-        base_pred = predictor.predict_one(sim_time, weather, df)
-        final_pred = base_pred * occ_mult[sim_occupancy]
-        st.session_state.last_sim_result = {
-            "final_pred": float(final_pred),
-            "sim_time": sim_time,
-            "sim_temp": float(sim_temp),
-            "sim_hum": int(sim_hum),
-            "sim_occupancy": sim_occupancy,
-        }
-        
-        # --- NEW & IMPROVED RESULT DISPLAY ---
-        res_c1, res_c2, res_c3 = st.columns([1, 1, 2])
-        
-        with res_c1:
-            st.metric("Expected Hourly Energy", f"{final_pred:.2f} kWh")
-        
-        with res_c2:
-            cost_est = final_pred * cost_per_kwh
-            st.metric("Hourly Cost", f"${cost_est:.3f}")
-            
-        with res_c3:
-            if final_pred > 0.6:
-                st.error("⚠️ High Demand Predicted")
-                st.progress(min(final_pred, 1.0))
-                st.caption("Suggestion: Schedule heavy appliances for off-peak hours.")
-            elif final_pred > 0.3:
-                st.warning("⚡ Moderate Usage")
-                st.progress(min(final_pred, 1.0))
-            else:
-                st.success("✅ Efficient State")
-                st.progress(min(final_pred, 1.0))
-    if show_explanations:
-        sim_result = st.session_state.get("last_sim_result")
-        if sim_result is None:
-            st.caption(
-                f"Insight: This simulator estimates one-hour energy for {sim_temp:.1f}°C, "
-                f"{sim_hum}% humidity, {sim_occupancy} occupancy at {hour_label(sim_hour)}."
-            )
+        st.info("No data available for the selected dashboard window.")
+
+    st.markdown("#### Next Best Action")
+    recommendations = generate_action_recommendations(
+        current_kwh,
+        forecast_overlay if show_forecast_overlay else pd.DataFrame()
+    )
+    st.write(f"- {recommendations[0]}")
+
+with tab_history:
+    st.subheader("Historical Trends")
+    st.caption("Choose a range to inspect past usage patterns and hourly intensity.")
+    c1, c2, c3 = st.columns([2, 2, 2])
+    with c1:
+        quick_range = st.radio("Range", ["24H", "7D", "30D", "Custom"], horizontal=True, key="history_range")
+    with c2:
+        compare_previous = st.toggle("Compare with previous period", value=False, key="history_compare")
+    with c3:
+        show_anomaly_markers = st.toggle("Show anomaly markers", value=True, key="history_anomalies")
+
+    custom_history_range = None
+    if quick_range == "Custom":
+        custom_history_range = st.date_input(
+            "Custom Range",
+            value=(min_date, min(max_date, min_date + datetime.timedelta(days=14))),
+            min_value=min_date,
+            max_value=max_date,
+            key="history_custom_range"
+        )
+
+    history_df = apply_quick_range(df, quick_range, custom_history_range)
+    if history_df.empty:
+        st.warning("No data in selected range.")
+    else:
+        # Keep old visual behavior: high-resolution area chart for smaller windows,
+        # daily aggregate for very large windows.
+        if len(history_df) < 2000:
+            chart_data = history_df[['energy_kwh']].copy().sort_index().reset_index().rename(columns={'index': 'Timestamp'})
+            tooltip_format = '%d %b %H:%M:%S'
+            threshold = history_df['energy_kwh'].mean() + (1.5 * history_df['energy_kwh'].std())
+            resample_freq = None
         else:
-            pred_val = sim_result["final_pred"]
-            demand_text = "high demand" if pred_val > 0.6 else "moderate demand" if pred_val > 0.3 else "efficient demand"
-            st.caption(
-                f"Insight: Scenario predicts {pred_val:.2f} kWh at {sim_result['sim_time'].strftime('%H:%M')} "
-                f"under {sim_result['sim_temp']:.1f}°C / {sim_result['sim_hum']}% humidity ({sim_result['sim_occupancy']} occupancy), "
-                f"which indicates {demand_text}."
+            chart_data = history_df['energy_kwh'].resample('D').sum().reset_index()
+            chart_data.columns = ['Timestamp', 'energy_kwh']
+            tooltip_format = '%d %b'
+            threshold = chart_data['energy_kwh'].mean() + chart_data['energy_kwh'].std()
+            resample_freq = 'D'
+
+        base = alt.Chart(chart_data).encode(
+            x=alt.X('Timestamp:T', title='Time', axis=alt.Axis(grid=False)),
+            y=alt.Y('energy_kwh:Q', title='Energy (kWh)'),
+            tooltip=[alt.Tooltip('Timestamp:T', format=tooltip_format), alt.Tooltip('energy_kwh:Q', format='.3f')]
+        )
+        area = base.mark_area(
+            line={'color': '#3b82f6'},
+            color=alt.Gradient(
+                gradient='linear',
+                stops=[
+                    alt.GradientStop(color='#3b82f6', offset=0),
+                    alt.GradientStop(color='rgba(59, 130, 246, 0.10)', offset=1)
+                ],
+                x1=1, x2=1, y1=1, y2=0
             )
+        )
+        layers = area
+
+        if show_anomaly_markers:
+            points = base.mark_circle(size=60, opacity=0.85).encode(
+                color=alt.condition(
+                    alt.datum.energy_kwh > threshold,
+                    alt.value('#ef4444'),
+                    alt.value('transparent')
+                )
+            )
+            layers = layers + points
+
+        if compare_previous:
+            duration = history_df.index.max() - history_df.index.min()
+            prev_start = history_df.index.min() - duration
+            prev_end = history_df.index.min()
+            previous = df[(df.index >= prev_start) & (df.index < prev_end)].copy()
+            if not previous.empty:
+                if resample_freq == 'D':
+                    previous = previous['energy_kwh'].resample('D').sum().reset_index()
+                    previous.columns = ['Timestamp', 'energy_kwh']
+                else:
+                    previous = previous[['energy_kwh']].sort_index().reset_index().rename(columns={'index': 'Timestamp'})
+                previous['Timestamp'] = previous['Timestamp'] + duration
+                prev_line = alt.Chart(previous).mark_line(color='#94a3b8', strokeDash=[4, 4], strokeWidth=2).encode(
+                    x='Timestamp:T',
+                    y='energy_kwh:Q',
+                    tooltip=[alt.Tooltip('Timestamp:T', format=tooltip_format), alt.Tooltip('energy_kwh:Q', format='.3f')]
+                )
+                layers = layers + prev_line
+
+        st.altair_chart(
+            layers.interactive().properties(height=360).configure_view(strokeWidth=0),
+            use_container_width=True
+        )
+
+        st.markdown("#### Hourly Intensity Heatmap")
+        heatmap_data = history_df.copy()
+        heatmap_data['Hour'] = heatmap_data.index.hour
+        heatmap_source = heatmap_data.groupby('Hour', as_index=False)['energy_kwh'].mean()
+        heatmap = alt.Chart(heatmap_source).mark_rect().encode(
+            x=alt.X('Hour:O', title='Hour of Day'),
+            y=alt.Y('energy_kwh:Q', title='Avg kWh'),
+            color=alt.Color('energy_kwh:Q', scale=alt.Scale(scheme='blues'), title='kWh'),
+            tooltip=[alt.Tooltip('Hour:O'), alt.Tooltip('energy_kwh:Q', format='.3f')]
+        ).properties(height=210)
+        st.altair_chart(heatmap, use_container_width=True)
+
+        peak = history_df['energy_kwh'].max()
+        low = history_df['energy_kwh'].min()
+        avg = history_df['energy_kwh'].mean()
+        h1, h2, h3 = st.columns(3)
+        h1.metric("Average", f"{avg:.3f} kWh")
+        h2.metric("Peak", f"{peak:.3f} kWh")
+        h3.metric("Lowest", f"{low:.3f} kWh")
+        st.download_button(
+            "Download Filtered History CSV",
+            data=dataframe_to_csv_bytes(history_df.reset_index()),
+            file_name=f"history_{quick_range.lower()}_{datetime.datetime.now().strftime('%Y%m%d_%H%M')}.csv",
+            mime="text/csv",
+            key="download_history"
+        )
+        if show_explanations:
+            peak_time = history_df['energy_kwh'].idxmax()
+            st.caption(f"Peak was {peak:.3f} kWh near {peak_time.strftime('%d %b %I:%M %p')}.")
+
+with tab_prediction:
+    st.subheader("Forecast")
+    st.caption("Create a forward forecast using current weather and recent usage history.")
+    p1, p2, p3 = st.columns([1, 1, 2])
+    with p1:
+        horizon = st.selectbox("Horizon", [24, 48, 72, 168], index=0, format_func=lambda x: f"Next {x}h")
+    with p2:
+        temp_offset = st.slider("What-if temp offset (°C)", -5, 5, 0, 1)
+    with p3:
+        behavior = st.select_slider("Behavior profile", options=["Conservative", "Normal", "Heavy"], value="Normal")
+
+    behavior_mult = {"Conservative": 0.92, "Normal": 1.0, "Heavy": 1.12}
+    if st.button("Generate Forecast", key="btn_forecast_pro", type="primary"):
+        if not city_name:
+            st.warning("Location not detected. Please wait for GPS or enter a location.")
+        else:
+            with st.spinner("Running AI forecast..."):
+                try:
+                    forecast_weather = get_weather_forecast(city_name, hours=int(horizon))
+                    for w in forecast_weather:
+                        w['Temperature'] = float(w.get('Temperature', 25.0)) + temp_offset
+                    now = pd.Timestamp.now()
+                    predictions = predictor.predict_forecast(now.ceil('H'), forecast_weather, df)
+                    pred_df = build_forecast_dataframe(predictions, df)
+                    pred_df['kwh'] = pred_df['kwh'] * behavior_mult[behavior]
+                    pred_df['min_kwh'] = pred_df['min_kwh'] * behavior_mult[behavior]
+                    pred_df['max_kwh'] = pred_df['max_kwh'] * behavior_mult[behavior]
+                    st.session_state.forecast_df = pred_df
+                except Exception as e:
+                    st.error(f"Forecast Error: {str(e)}")
+
+    if 'forecast_df' in st.session_state and not st.session_state.forecast_df.empty:
+        pred_df = st.session_state.forecast_df.copy()
+        pred_df['time'] = pd.to_datetime(pred_df['time'])
+        peak_row = pred_df.loc[pred_df['kwh'].idxmax()]
+        peak_time = peak_row['time']
+        peak_load = float(pred_df['kwh'].max())
+        total_load = pred_df['kwh'].sum()
+        pi1, pi2, pi3 = st.columns(3)
+        pi1.metric("Projected Total", f"{total_load:.1f} kWh")
+        pi2.metric("Peak Hour Energy", f"{peak_load:.2f} kWh")
+        pi3.metric("Peak Hour", peak_time.strftime("%d %b %I:%M %p"))
+
+        f_chart = alt.Chart(pred_df).mark_area(
+            line={'color': '#8b5cf6'},
+            color=alt.Gradient(
+                gradient='linear',
+                stops=[
+                    alt.GradientStop(color='#8b5cf6', offset=0),
+                    alt.GradientStop(color='rgba(139, 92, 246, 0.1)', offset=1)
+                ],
+                x1=1, x2=1, y1=1, y2=0
+            )
+        ).encode(
+            x=alt.X('time:T', title='Timeline', axis=alt.Axis(format='%H:%M')),
+            y=alt.Y('kwh:Q', title='Predicted Consumption (kWh)'),
+            tooltip=[alt.Tooltip('time:T', format='%d %b %H:%M'), alt.Tooltip('kwh:Q', format='.3f')]
+        ).properties(height=360)
+
+        peak_point = pd.DataFrame({'time': [peak_time], 'kwh': [peak_load]})
+        peak_layer = alt.Chart(peak_point).mark_point(color='#f43f5e', size=100, filled=True)
+        st.altair_chart((f_chart + peak_layer).interactive(), use_container_width=True)
+        st.info(
+            f"Expected peak around {peak_time.strftime('%I:%M %p')}. "
+            "Forecast is based on recent consumption behavior and weather conditions."
+        )
+        st.download_button(
+            "Download Forecast CSV",
+            data=dataframe_to_csv_bytes(pred_df),
+            file_name=f"forecast_{int(horizon)}h_{datetime.datetime.now().strftime('%Y%m%d_%H%M')}.csv",
+            mime="text/csv",
+            key="download_forecast"
+        )
+    else:
+        st.info("Generate a forecast to view confidence bands and recommendations.")
+
+with tab_alerts:
+    st.subheader("Alerts and Recommended Actions")
+    alert_df = build_alert_table(filtered_df, st.session_state.get('forecast_df', pd.DataFrame()), st.session_state.get('alerts', []))
+    if st.button("Acknowledge all alerts", key="ack_alerts"):
+        st.session_state.alert_acknowledged = True
+    if alert_df.empty:
+        st.success("No active alerts. Usage is within expected patterns.")
+    else:
+        if st.session_state.alert_acknowledged:
+            alert_df['status'] = 'Acknowledged'
+        summary = alert_df['severity'].value_counts().to_dict()
+        a1, a2, a3 = st.columns(3)
+        a1.metric("Open", int((alert_df['status'] == 'Open').sum()))
+        a2.metric("High", int(summary.get('High', 0)))
+        a3.metric("Medium", int(summary.get('Medium', 0)))
+        st.dataframe(alert_df, use_container_width=True, hide_index=True)
+        st.caption("Each alert includes impact and a next action to reduce cost or avoid peak load.")
 
 with tab_live:
     st.subheader("Smart Home Monitor")
@@ -916,86 +1096,60 @@ with tab_live:
         else:
             st.caption("Insight: Start telemetry to show a live trend summary here.")
 
-with tab_forecast:
-    st.subheader("24-Hour AI Forecast")
-    if 'forecast_df' in st.session_state and not st.session_state.forecast_df.empty:
-        st.download_button(
-            "Download Forecast CSV",
-            data=dataframe_to_csv_bytes(st.session_state.forecast_df),
-            file_name=f"forecast_24h_{datetime.datetime.now().strftime('%Y%m%d_%H%M')}.csv",
-            mime="text/csv",
-            key="download_forecast"
-        )
-    if show_explanations:
-        if 'forecast_df' in st.session_state and not st.session_state.forecast_df.empty:
-            fdf = st.session_state.forecast_df
-            peak_idx = fdf['kwh'].idxmax()
-            low_idx = fdf['kwh'].idxmin()
-            peak_row = fdf.loc[peak_idx]
-            low_row = fdf.loc[low_idx]
-            st.caption(
-                f"Insight: Next 24h total is {fdf['kwh'].sum():.1f} kWh. "
-                f"Peak around {peak_row['time'].strftime('%H:%M')} ({peak_row['kwh']:.2f} kWh), "
-                f"lowest around {low_row['time'].strftime('%H:%M')} ({low_row['kwh']:.2f} kWh)."
-            )
-        else:
-            st.caption("Insight: Generate forecast to see a concise total/peak/low summary.")
-    
-    if st.button("Generate Forecast", key="btn_forecast_pro", type="primary"):
-        if not city_name:
-            st.warning("Location not detected. Please wait for GPS or enter a location.")
-            st.stop() # Stop only this callback, not the whole app
+with tab_advanced:
+    st.subheader("Scenario Simulator")
+    if 'last_sim_result' not in st.session_state:
+        st.session_state.last_sim_result = None
 
-        with st.spinner("Running Neural Network Inference..."):
-            try:
-                forecast_weather = get_weather_forecast(city_name, hours=24)
-                if not forecast_weather:
-                    st.error("Could not fetch weather forecast. Please check internet connection.")
-                    st.stop()
-                    
-                now = pd.Timestamp.now()
-                predictions = predictor.predict_forecast(now.ceil('H'), forecast_weather, df)
-                pred_df = pd.DataFrame(predictions)
-                st.session_state.forecast_df = pred_df.copy()
-                
-                if pred_df.empty:
-                    st.error("Prediction model returned no data.")
-                    st.stop()
-            except Exception as e:
-                st.error(f"Forecast Error: {str(e)}")
-                st.stop()
-            
-            # --- INSIGHTS ---
-            peak_time = pred_df.loc[pred_df['kwh'].idxmax()]['time']
-            peak_load = pred_df['kwh'].max()
-            total_load = pred_df['kwh'].sum()
-            
-            i1, i2, i3 = st.columns(3)
-            i1.metric("Projected Total", f"{total_load:.1f} kWh")
-            i2.metric("Peak Hour Energy", f"{peak_load:.2f} kWh")
-            i3.metric("Peak Hour", peak_time.strftime("%I:%M %p"))
-            
-            # --- ADVANCED FORECAST CHART ---
-            f_chart = alt.Chart(pred_df).mark_area(
-                line={'color':'#8b5cf6'},
-                color=alt.Gradient(
-                    gradient='linear',
-                    stops=[alt.GradientStop(color='#8b5cf6', offset=0),
-                           alt.GradientStop(color='rgba(139, 92, 246, 0.1)', offset=1)],
-                    x1=1, x2=1, y1=1, y2=0
-                )
-            ).encode(
-                x=alt.X('time:T', title='Timeline', axis=alt.Axis(format='%H:%M')),
-                y=alt.Y('kwh:Q', title='Predicted Consumption (kWh)'),
-                tooltip=['time', 'kwh']
-            ).properties(height=350)
-            
-            # Add Peak Annotation
-            peak_point = pd.DataFrame({'time': [peak_time], 'kwh': [peak_load]})
-            peak_layer = alt.Chart(peak_point).mark_point(color='#f43f5e', size=100, filled=True)
-            
-            combined_chart = (f_chart + peak_layer).interactive()
-            st.altair_chart(combined_chart, use_container_width=True)
+    if city_name:
+        live_sim_weather = get_live_weather(city_name)
+        default_temp = float(live_sim_weather.get('Temperature', 25.0))
+        default_hum = int(live_sim_weather.get('Humidity', 50))
+    else:
+        default_temp = 25.0
+        default_hum = 50
+
+    sim_col1, sim_col2 = st.columns([1, 1])
+    with sim_col1:
+        sim_temp = st.slider("Outside Temperature (°C)", 0.0, 50.0, default_temp, key="sim_temp")
+        sim_hum = st.slider("Humidity (%)", 0, 100, default_hum, key="sim_hum")
+    with sim_col2:
+        sim_hour = st.slider("Hour of Day (0-23)", 0, 23, 18, key="sim_hour")
+        sim_occupancy = st.select_slider("Occupancy Level", options=["Low", "Medium", "High"], value="Medium", key="sim_occupancy")
+
+    if st.button("Run Scenario Analysis", key="run_scenario", type="primary"):
+        sim_time = datetime.datetime.now().replace(hour=sim_hour, minute=0, second=0)
+        occ_mult = {"Low": 0.8, "Medium": 1.0, "High": 1.3}
+        weather = {
+            'Temperature': sim_temp,
+            'Humidity': sim_hum,
+            'Pressure': 1013,
+            'WindSpeed': 5,
+            'Voltage': 230.0,
+            'Current': 2.0,
+            'Frequency': 50.0
+        }
+        base_pred = predictor.predict_one(sim_time, weather, df)
+        final_pred = base_pred * occ_mult[sim_occupancy]
+        st.session_state.last_sim_result = {
+            "final_pred": float(final_pred),
+            "sim_time": sim_time,
+            "sim_temp": float(sim_temp),
+            "sim_hum": int(sim_hum),
+            "sim_occupancy": sim_occupancy,
+        }
+    sim_result = st.session_state.get("last_sim_result")
+    if sim_result:
+        r1, r2, r3 = st.columns(3)
+        r1.metric("Expected Hourly Energy", f"{sim_result['final_pred']:.2f} kWh")
+        r2.metric("Estimated Cost", f"${sim_result['final_pred'] * cost_per_kwh:.3f}")
+        r3.metric("Scenario Time", sim_result['sim_time'].strftime("%I:%M %p"))
+        if show_explanations:
+            st.caption(
+                f"Scenario predicts {sim_result['final_pred']:.2f} kWh at "
+                f"{sim_result['sim_temp']:.1f}°C / {sim_result['sim_hum']}% humidity "
+                f"with {sim_result['sim_occupancy']} occupancy."
+            )
 
 # --- 7. Solar Potential Tab ---
 with tab_solar:
