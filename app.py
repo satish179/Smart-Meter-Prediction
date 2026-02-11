@@ -634,6 +634,16 @@ if 'alert_acknowledged' not in st.session_state:
 forecast_overlay = st.session_state.forecast_df.copy() if not st.session_state.forecast_df.empty else pd.DataFrame()
 current_kwh = float(filtered_df['energy_kwh'].iloc[-1]) if not filtered_df.empty else 0.0
 current_cost_hour = current_kwh * cost_per_kwh
+current_kw = current_kwh
+if len(filtered_df) >= 3:
+    recent_idx = filtered_df.index.to_series().tail(120)
+    median_delta_seconds = recent_idx.diff().dt.total_seconds().dropna()
+    median_delta_seconds = median_delta_seconds[median_delta_seconds > 0]
+    if not median_delta_seconds.empty:
+        sample_seconds = float(median_delta_seconds.median())
+        sample_hours = sample_seconds / 3600.0
+        if sample_hours > 0:
+            current_kw = current_kwh / sample_hours
 status_text = "Normal"
 if not filtered_df.empty:
     if current_kwh > filtered_df['energy_kwh'].quantile(0.9):
@@ -654,12 +664,14 @@ with tab_dashboard:
     yesterday_total = float(yesterday_data['energy_kwh'].sum()) if not yesterday_data.empty else 0.0
     today_delta = (today_total - yesterday_total) if yesterday_total > 0 else None
     c1, c2, c3 = st.columns(3)
-    c1.metric("Current Usage", f"{current_kwh:.3f} kWh")
+    c1.metric("Current Usage", f"{current_kw:.3f} kW")
     c2.metric("Today Total", f"{today_total:.2f} kWh", delta=f"{today_delta:+.2f} vs yesterday" if today_delta is not None else None)
     c3.metric("Estimated Cost Today", f"${today_total * cost_per_kwh:.2f}")
 
     if not dashboard_df.empty:
-        plot_df = dashboard_df[['energy_kwh']].copy().sort_index().reset_index().rename(columns={'index': 'Timestamp'})
+        # Aggregate to hourly bins for readability and consistency with forecast horizon.
+        plot_df = dashboard_df[['energy_kwh']].copy().sort_index()
+        plot_df = plot_df.resample('H').sum().reset_index().rename(columns={'index': 'Timestamp'})
         actual = alt.Chart(plot_df).mark_area(
             line={'color': '#3b82f6'},
             color=alt.Gradient(
@@ -672,8 +684,8 @@ with tab_dashboard:
             )
         ).encode(
             x=alt.X('Timestamp:T', title='Time'),
-            y=alt.Y('energy_kwh:Q', title='Energy (kWh)'),
-            tooltip=[alt.Tooltip('Timestamp:T', format='%d %b %H:%M'), alt.Tooltip('energy_kwh:Q', format='.3f')]
+            y=alt.Y('energy_kwh:Q', title='Energy (kWh / hour)'),
+            tooltip=[alt.Tooltip('Timestamp:T', format='%d %b %H:%M'), alt.Tooltip('energy_kwh:Q', format='.3f', title='kWh')]
         )
         layers = actual
         if show_forecast_overlay and not forecast_overlay.empty:
@@ -690,12 +702,6 @@ with tab_dashboard:
     else:
         st.info("No data available for the selected dashboard window.")
 
-    st.markdown("#### Next Best Action")
-    recommendations = generate_action_recommendations(
-        current_kwh,
-        forecast_overlay if show_forecast_overlay else pd.DataFrame()
-    )
-    st.write(f"- {recommendations[0]}")
 
 with tab_history:
     st.subheader("Historical Trends")
@@ -1098,6 +1104,7 @@ with tab_live:
 
 with tab_advanced:
     st.subheader("Scenario Simulator")
+    st.info("Set weather/time/occupancy, then click 'Run Scenario Analysis' to get prediction and recommendation.")
     if 'last_sim_result' not in st.session_state:
         st.session_state.last_sim_result = None
 
@@ -1144,12 +1151,58 @@ with tab_advanced:
         r1.metric("Expected Hourly Energy", f"{sim_result['final_pred']:.2f} kWh")
         r2.metric("Estimated Cost", f"${sim_result['final_pred'] * cost_per_kwh:.3f}")
         r3.metric("Scenario Time", sim_result['sim_time'].strftime("%I:%M %p"))
+        st.markdown("#### Recommendation")
+        # Dynamic thresholds based on recent history so recommendation reflects local usage reality.
+        if 'energy_kwh' in df.columns and not df.empty:
+            # Use hourly aggregated history and ignore empty bins to avoid tiny per-second
+            # telemetry values forcing every scenario into "High".
+            recent = (
+                df[['energy_kwh']]
+                .sort_index()
+                .resample('H')
+                .sum(min_count=1)['energy_kwh']
+                .dropna()
+                .tail(24 * 30)
+            )
+        else:
+            recent = pd.Series(dtype=float)
+        if recent.empty:
+            low_thr = 0.3
+            high_thr = 0.6
+        else:
+            low_thr = float(recent.quantile(0.60))
+            high_thr = float(recent.quantile(0.85))
+            # Safety floors for stable labels across sparse/noisy telemetry sessions.
+            low_thr = max(0.20, low_thr)
+            high_thr = max(0.35, high_thr)
+            if high_thr <= low_thr:
+                high_thr = low_thr + 0.08
+
+        pred_val = float(sim_result['final_pred'])
+        if pred_val >= high_thr:
+            st.warning(
+                f"High demand expected ({pred_val:.2f} kWh). "
+                "Shift heavy appliances and avoid overlapping HVAC/heater/EV loads."
+            )
+        elif pred_val >= low_thr:
+            st.info(
+                f"Moderate demand ({pred_val:.2f} kWh). "
+                "Keep heavy loads staggered to prevent peak spikes."
+            )
+        else:
+            st.success(
+                f"Efficient window ({pred_val:.2f} kWh). "
+                "Good time for discretionary loads."
+            )
+        st.caption(f"Dynamic thresholds: Efficient < {low_thr:.2f}, Moderate {low_thr:.2f}-{high_thr:.2f}, High >= {high_thr:.2f} kWh.")
         if show_explanations:
             st.caption(
                 f"Scenario predicts {sim_result['final_pred']:.2f} kWh at "
                 f"{sim_result['sim_temp']:.1f}°C / {sim_result['sim_hum']}% humidity "
                 f"with {sim_result['sim_occupancy']} occupancy."
             )
+    else:
+        st.caption("No scenario result yet. Run analysis to see predicted energy, cost, and recommendation.")
 
 # --- 7. Solar Potential Tab ---
 with tab_solar:
