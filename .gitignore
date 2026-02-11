@@ -34,3 +34,14 @@ streamlit_run.err.log
 *.docx
 *.pdf
 !requirements.txt
+
+# Keep only runtime CEEW artifacts
+models/*
+!models/ceew_br04_production.h5
+!models/ceew_br04_scaler.pkl
+!models/ceew_br04_features.pkl
+models_enhanced/
+
+# Keep only active dataset
+enhanced_datasets/*
+!enhanced_datasets/CEEW_BR04_with_weather.csv
