@@ -1,0 +1,121 @@
+﻿PROJECT SUMMARY - LUMINA (SMART HOME ENERGY PREDICTION & MONITORING)
+=====================================================================
+
+1) WHAT THE PROJECT IS
+----------------------
+Lumina is a Streamlit-based prototype for household energy analytics.
+It combines:
+- Historical consumption analysis
+- AI-based 24-hour energy forecasting
+- Live virtual smart meter simulation
+- Weather-aware demand context
+- Anomaly alerts
+- Solar generation and ROI estimation
+- CSV export and quick demo mode for presentations
+
+Main app entry point:
+- app.py
+
+Core modules:
+- src/inference_ceew.py      -> Production model inference
+- src/preprocessing_ceew.py  -> CEEW preprocessing for app usage
+- src/weather.py             -> Live/forecast weather integration
+- src/virtual_meter.py       -> Virtual smart meter telemetry
+- src/anomaly.py             -> Usage anomaly detection
+- src/solar.py               -> Solar potential and ROI logic
+- src/chatbot.py             -> Basic assistant responses
+
+
+2) DATASETS USED
+----------------
+Primary active dataset (current app + production model):
+- enhanced_datasets/CEEW_BR04_with_weather.csv
+
+Dataset origin/context in this project:
+- archive_extracted/CEEW - Smart meter data Bareilly 2020.csv (meter BR04 source)
+- datasets_extracted/dataset/WeatherData.csv (weather context source for augmentation)
+
+What the active dataset contains:
+- Smart meter timestamped consumption and electrical signals
+- Weather attributes mapped to timestamps
+- Used after hourly resampling in preprocessing/inference flow
+
+
+3) MODELS IN THE PROJECT
+------------------------
+A) Active production model used by app.py
+- Model file:   models/ceew_br04_production.h5
+- Scaler:       models/ceew_br04_scaler.pkl
+- Features:     models/ceew_br04_features.pkl
+- Metadata:     models/ceew_br04_metadata.pkl
+
+Saved production metrics (from metadata):
+- R2 score:        0.8921969491 (~89.22%)
+- MAE:             0.0994245801 kWh
+- Train records:   7452
+- Test records:    828
+- Date range:      2020-01-08 00:00:00 to 2020-12-31 23:00:00
+
+B) Additional/legacy model artifacts present
+- models/dnn_CEEW_BR04.h5 (+ scaler/features)
+- models/dnn_model.h5 (+ scaler/features)
+- models/dnn_temporal.h5 (+ scaler/features)
+- models/xgboost_model.pkl
+- models/xgb_temporal.pkl (+ features)
+- models/scaler_X.pkl, models/scaler_y.pkl
+- models/feature_names.pkl, models/feature_names_lstm.pkl
+
+Note:
+- The current app flow (EnergyPredictor alias) uses the CEEW production stack in src/inference_ceew.py.
+
+
+4) FEATURES ADDED / USED FOR FORECASTING
+-----------------------------------------
+The active production model uses 17 engineered features:
+
+Lag & rolling features:
+1. lag_1h
+2. lag_24h
+3. lag_168h
+4. rolling_mean_24h
+5. rolling_std_24h
+
+Time features:
+6. hour
+7. day_of_week
+8. month
+9. hour_sin
+10. hour_cos
+
+Electrical features:
+11. z_Avg Voltage (Volt)
+12. z_Avg Current (Amp)
+13. y_Freq (Hz)
+
+Weather features:
+14. temp
+15. humidity
+16. pressure
+17. wind_speed
+
+
+5) OTHER FUNCTIONAL ADD-ONS IMPLEMENTED
+---------------------------------------
+- Quick Demo Mode (preloads location, synthetic live telemetry, forecast)
+- Compact Layout mode (better small-screen readability)
+- Live telemetry performance controls:
+  - Refresh Interval
+  - Samples per Burst
+  - Chart Points
+- Download buttons:
+  - Forecast CSV
+  - Live log/session CSV
+- Live log parser hardening and auto-repair for malformed CSV rows
+
+
+6) OUTPUT ARTIFACTS CREATED IN THIS REPO
+----------------------------------------
+Documentation files generated for this project:
+- Project_Report_Lumina.docx
+- Project_Report_Lumina_50Pages.docx
+

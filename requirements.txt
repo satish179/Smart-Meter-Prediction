@@ -1,0 +1,10 @@
+streamlit
+pandas
+numpy
+altair
+tensorflow
+joblib
+requests
+geopy
+streamlit-js-eval
+scikit-learn

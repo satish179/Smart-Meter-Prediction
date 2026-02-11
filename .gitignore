@@ -1,0 +1,29 @@
+﻿# Python
+.venv/
+__pycache__/
+*.pyc
+
+# IDE
+.vscode/
+.sfdx/
+
+# Secrets
+.streamlit/secrets.toml
+
+# Large raw archives and extracted data
+archive/
+archive_extracted/
+datasets_extracted/
+archive.zip
+dataset.zip
+
+# Large intermediate/raw data
+energy_weather_raw_data.csv
+weather_patterns.pkl
+
+# Runtime logs
+streamlit_run.log
+streamlit_run.err.log
+
+# Optional local outputs
+*.tmp
