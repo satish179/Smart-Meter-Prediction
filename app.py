@@ -667,6 +667,23 @@ with tab_dashboard:
     c1.metric("Current Usage", f"{current_kw:.3f} kW")
     c2.metric("Today Total", f"{today_total:.2f} kWh", delta=f"{today_delta:+.2f} vs yesterday" if today_delta is not None else None)
     c3.metric("Estimated Cost Today", f"${today_total * cost_per_kwh:.2f}")
+    if not today_data.empty:
+        peak_series = today_data['energy_kwh'].dropna()
+        peak_idx = peak_series.idxmax() if not peak_series.empty else pd.Timestamp.now()
+        peak_val = float(peak_series.max()) if not peak_series.empty else 0.0
+        if today_delta is None:
+            today_vs_yday = "Yesterday comparison not available yet."
+        elif today_delta > 0:
+            today_vs_yday = f"Today is {abs(today_delta):.2f} kWh higher than yesterday."
+        elif today_delta < 0:
+            today_vs_yday = f"Today is {abs(today_delta):.2f} kWh lower than yesterday."
+        else:
+            today_vs_yday = "Today is the same as yesterday so far."
+        st.caption(
+            f"{today_vs_yday} Peak so far: {peak_val:.3f} kWh at {pd.Timestamp(peak_idx).strftime('%I:%M %p')}."
+        )
+    else:
+        st.caption("No data yet for today. Enable Live telemetry to begin tracking.")
 
     if not dashboard_df.empty:
         # Aggregate to hourly bins for readability and consistency with forecast horizon.
