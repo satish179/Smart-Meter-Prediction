@@ -27,3 +27,10 @@ streamlit_run.err.log
 
 # Optional local outputs
 *.tmp
+
+# Exclude text/docs from repository (keep dependency manifest)
+*.txt
+*.doc
+*.docx
+*.pdf
+!requirements.txt

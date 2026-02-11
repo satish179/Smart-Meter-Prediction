@@ -1,7 +1,0 @@
-ABSTRACT
-
-The rapid proliferation of smart home technologies and the increasing demand for energy efficiency necessitate advanced monitoring and forecasting systems. This project presents a "Smart Home Energy Prediction & Monitoring System," a comprehensive solution designed to optimize household electricity consumption through Machine Learning (ML) and real-time data analytics. 
-
-Leveraging historical smart meter data from CEEW (Council on Energy, Environment and Water) and integrating live weather APIs, the system utilizes a **Deep Neural Network (DNN)** to forecast energy usage with **89.22% accuracy**. The DNN architecture is optimized to capture complex non-linear relationships between weather parameters (Temperature, Humidity) and household load patterns.
-
-A novel feature of this system is the **Virtual Smart Meter**, a physics-based digital twin that simulates real-time energy streams (Voltage, Current, Power) to overcome hardware limitations in prototyping. The application, built on Streamlit, offers a unified dashboard for predictive analytics, anomaly detection, and "what-if" scenario simulation. Furthermore, it incorporates gamification elements and sustainability metrics—converting energy usage into Carbon Footprint and tree equivalents—to incentivize behavioral change. The result is a robust, scalable prototype that demonstrates the potential of AI-driven energy management in reducing costs and environmental impact for modern households.
