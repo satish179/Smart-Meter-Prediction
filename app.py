@@ -3,7 +3,6 @@ import pandas as pd
 import numpy as np
 import altair as alt
 import datetime
-import time
 import os
 import csv
 import html
@@ -1112,9 +1111,14 @@ with tab_live:
     if st.toggle("Enable Real-Time Telemetry", key="live_monitor_active", value=False):
         if 'live_history' not in st.session_state:
             st.session_state.live_history = pd.DataFrame(columns=['Time', 'Power'])
-            
+        if 'last_live_data' not in st.session_state:
+            st.session_state.last_live_data = None
+
+        # Non-blocking telemetry: process a burst per rerun (no sleep/rerun loop),
+        # so other tabs stay interactive while live mode is on.
         for _ in range(int(samples_per_burst)):
             data = st.session_state.virtual_meter.generate_reading()
+            now = datetime.datetime.now()
             try:
                 row = {k: data.get(k) for k in LIVE_LOG_COLUMNS}
                 pd.DataFrame([row], columns=LIVE_LOG_COLUMNS).to_csv(
@@ -1125,55 +1129,57 @@ with tab_live:
                 )
             except Exception:
                 pass
-            
-            # Append to session history
-            now = datetime.datetime.now()
+
             new_row = pd.DataFrame({'Time': [now], 'Power': [data['power_kw']]})
             st.session_state.live_history = pd.concat([st.session_state.live_history, new_row]).tail(max_points)
-            
-            # Update Chart every iteration is heavy, but needed for "Live" feel. 
-            # Optimization: Create chart object once and update data? Streamlit makes this hard.
-            # We keep it but ensure it's efficient.
-            
-            with chart_placeholder.container():
-                # Simplified Chart for performance - faster rendering
-                live_chart = alt.Chart(st.session_state.live_history).mark_area(
-                    line={'color':'#10b981'},
-                    color=alt.Gradient(
-                        gradient='linear',
-                        stops=[alt.GradientStop(color='#10b981', offset=0),
-                               alt.GradientStop(color='rgba(16, 185, 129, 0.1)', offset=1)],
-                        x1=1, x2=1, y1=1, y2=0
-                    )
-                ).encode(
-                    x=alt.X('Time:T', axis=alt.Axis(format='%H:%M:%S', title=None)), # Remove title for speed/cleanliness
-                    y=alt.Y('Power:Q', scale=alt.Scale(domain=[0, 8]), title=None),
-                ).properties(height=250, title="Live Power (kW)")
-                
-                st.altair_chart(live_chart, use_container_width=True)
-                
-            with metric_placeholder.container():
-                # Metric Strip
-                m1, m2, m3, m4 = st.columns(4)
-                m1.metric("Power", f"{data['power_kw']:.2f} kW")
-                m2.metric("Voltage", f"{data['voltage_v']} V")
-                m3.metric("Current", f"{data['current_a']} A")
-                m4.metric("Freq", f"{data['frequency_hz']} Hz")
-                
-                # Check for Anomalies
-                alert = st.session_state.anomaly_detector.check_anamoly(now, data['power_kw'])
-                if alert:
-                    st.toast(alert, icon="🚨")
-                    st.session_state.alerts.insert(0, f"{now.strftime('%H:%M:%S')}: {alert}")
-                    
-                # Show Recent Alerts (Limit to 3 for performance)
-                if st.session_state.alerts:
-                    with st.expander("🚨 Recent Alerts", expanded=True):
-                        for a in st.session_state.alerts[:3]: 
-                            st.write(a)
-            
-            time.sleep(refresh_interval)
-        st.rerun()
+            st.session_state.last_live_data = data
+
+            alert = st.session_state.anomaly_detector.check_anamoly(now, data['power_kw'])
+            if alert:
+                st.toast(alert, icon="🚨")
+                st.session_state.alerts.insert(0, f"{now.strftime('%H:%M:%S')}: {alert}")
+        st.caption(
+            f"Live telemetry running in non-blocking mode. "
+            f"Collecting {int(samples_per_burst)} samples per app update "
+            f"(target cadence {refresh_interval:.1f}s)."
+        )
+
+    with chart_placeholder.container():
+        if 'live_history' in st.session_state and not st.session_state.live_history.empty:
+            live_chart = alt.Chart(st.session_state.live_history).mark_area(
+                line={'color':'#10b981'},
+                color=alt.Gradient(
+                    gradient='linear',
+                    stops=[alt.GradientStop(color='#10b981', offset=0),
+                           alt.GradientStop(color='rgba(16, 185, 129, 0.1)', offset=1)],
+                    x1=1, x2=1, y1=1, y2=0
+                )
+            ).encode(
+                x=alt.X('Time:T', axis=alt.Axis(format='%H:%M:%S', title=None)),
+                y=alt.Y('Power:Q', scale=alt.Scale(domain=[0, 8]), title=None),
+            ).properties(height=250, title="Live Power (kW)")
+            st.altair_chart(live_chart, use_container_width=True)
+        else:
+            st.info("Start telemetry to generate live chart data.")
+
+    with metric_placeholder.container():
+        data = st.session_state.get('last_live_data')
+        m1, m2, m3, m4 = st.columns(4)
+        if data:
+            m1.metric("Power", f"{data['power_kw']:.2f} kW")
+            m2.metric("Voltage", f"{data['voltage_v']} V")
+            m3.metric("Current", f"{data['current_a']} A")
+            m4.metric("Freq", f"{data['frequency_hz']} Hz")
+        else:
+            m1.metric("Power", "0.00 kW")
+            m2.metric("Voltage", "0 V")
+            m3.metric("Current", "0 A")
+            m4.metric("Freq", "0 Hz")
+
+        if st.session_state.get('alerts'):
+            with st.expander("🚨 Recent Alerts", expanded=True):
+                for a in st.session_state.alerts[:3]:
+                    st.write(a)
 
     st.divider()
     st.markdown("#### Export Data")
