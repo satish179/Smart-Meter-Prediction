@@ -6,6 +6,7 @@ import datetime
 import time
 import os
 import csv
+import html
 
 # Custom Modules
 from src.inference_ceew import CEEWEnergyPredictor as EnergyPredictor
@@ -149,13 +150,17 @@ st.markdown("""
         border-radius: 10px;
         font-weight: 700;
         transition: background-color 0.2s;
-        width: 100%;
+        width: auto !important;
+        white-space: nowrap;
+        padding: 0.35rem 0.8rem !important;
     }
 
     .stTextInput input, .stDateInput input {
         border-radius: 10px !important;
+        text-overflow: ellipsis;
+        overflow: hidden;
     }
-    
+
     /* Tabs */
     .stTabs [data-baseweb="tab-list"] {
         gap: 14px;
@@ -191,6 +196,34 @@ def dataframe_to_csv_bytes(df, include_index=False):
 
 def hour_label(hour_value):
     return f"{int(hour_value):02d}:00"
+
+@st.cache_data(ttl=120, show_spinner=False)
+def get_live_weather_cached(location):
+    return get_live_weather(location)
+
+def is_coordinate_string(value):
+    if not isinstance(value, str) or "," not in value:
+        return False
+    parts = [p.strip() for p in value.split(",")]
+    if len(parts) != 2:
+        return False
+    try:
+        float(parts[0])
+        float(parts[1])
+        return True
+    except (TypeError, ValueError):
+        return False
+
+def location_font_size(place_name):
+    text = str(place_name or "").strip()
+    length = len(text)
+    if length <= 12:
+        return "2.0rem"
+    if length <= 18:
+        return "1.7rem"
+    if length <= 26:
+        return "1.4rem"
+    return "1.15rem"
 
 def seed_demo_live_history(num_points=120):
     """Create lightweight synthetic live telemetry history for instant demo readiness."""
@@ -379,6 +412,12 @@ with st.sidebar:
         st.session_state.quick_demo_mode = False
     if 'demo_bootstrapped' not in st.session_state:
         st.session_state.demo_bootstrapped = False
+    if 'last_geo_coords' not in st.session_state:
+        st.session_state.last_geo_coords = None
+    if 'last_geo_bucket' not in st.session_state:
+        st.session_state.last_geo_bucket = None
+    if 'weather_query' not in st.session_state:
+        st.session_state.weather_query = ""
 
     # Legacy IP callback removed to enforce GPS
     def update_location_callback():
@@ -395,45 +434,64 @@ with st.sidebar:
         st.session_state.demo_bootstrapped = False
 
     st.markdown("**Location**")
+    fetch_location_clicked = False
 
+    col_loc1, col_loc2 = st.columns([4, 1])
+    with col_loc2:
+        fetch_location_clicked = st.button("Fetch", help="Fetch location from GPS")
 
     # Enforce Precise Location (GPS)
     geo_data = get_geolocation()
     if geo_data and 'coords' in geo_data:
         lat = geo_data['coords']['latitude']
         lon = geo_data['coords']['longitude']
-        coord_string = f"{lat},{lon}"
+        coord_string = f"{lat:.5f},{lon:.5f}"
+        coord_bucket = f"{lat:.3f},{lon:.3f}"
+        st.session_state.weather_query = coord_string
 
-        if 'last_geo_coords' not in st.session_state:
-            st.session_state.last_geo_coords = None
-            
-        if st.session_state.last_geo_coords != coord_string:
+        should_resolve = fetch_location_clicked or (st.session_state.last_geo_bucket != coord_bucket)
+        if should_resolve:
             st.session_state.last_geo_coords = coord_string
+            st.session_state.last_geo_bucket = coord_bucket
             # Resolve using geopy to get Major City
             with st.spinner("Finding nearest major city..."):
                 city = get_major_city(lat, lon)
-                if city:
-                    st.session_state.location = city
-                else:
-                    st.session_state.location = coord_string
+                if city and str(city).strip():
+                    st.session_state.location = str(city).strip()
+                if not st.session_state.location or is_coordinate_string(st.session_state.location):
+                    # Fallback: derive a human-readable location from weather provider.
+                    weather_probe = get_live_weather_cached(coord_string)
+                    provider_name = str(weather_probe.get("LocationName", "")).strip()
+                    if provider_name and not is_coordinate_string(provider_name):
+                        st.session_state.location = provider_name
+                    elif not st.session_state.location:
+                        st.session_state.location = "Location unavailable"
             st.rerun()
 
-    col_loc1, col_loc2 = st.columns([3, 1])
     with col_loc1:
         city_name = st.text_input("Region Name", key="location", label_visibility="collapsed")
-    
-    with col_loc2:
-        # Button merely triggers rerun, allowing get_geolocation to fire again if needed
-        st.button("Refresh", help="Refresh GPS Location")
+        if city_name and not is_coordinate_string(city_name) and city_name != "Location unavailable":
+            st.session_state.weather_query = city_name
     
 
 
     with st.expander("🌤️ Live Conditions", expanded=True):
         live_box = st.empty()
         with live_box.container():
-            if city_name:
-                live_weather = get_live_weather(city_name)
-                resolved_name = live_weather.get("LocationName", city_name)
+            weather_query = st.session_state.get("weather_query", "") or city_name
+            if weather_query:
+                live_weather = get_live_weather_cached(weather_query)
+                resolved_name = live_weather.get(
+                    "LocationName",
+                    st.session_state.get("location") or city_name or "Location unavailable"
+                )
+                if is_coordinate_string(str(resolved_name)):
+                    if st.session_state.get("location") and not is_coordinate_string(str(st.session_state.get("location"))):
+                        resolved_name = st.session_state.location
+                    elif city_name and not is_coordinate_string(str(city_name)):
+                        resolved_name = city_name
+                    else:
+                        resolved_name = "Location unavailable"
             else:
                 live_weather = {
                     "Temperature": 0,
@@ -446,7 +504,18 @@ with st.sidebar:
                 st.info("Waiting for location details...")
 
             c1, c2, c3 = st.columns(3)
-            c1.metric("Location", resolved_name)
+            with c1:
+                loc_text = str(resolved_name or "Location unavailable")
+                loc_size = location_font_size(loc_text)
+                st.markdown("**Location**")
+                st.markdown(
+                    f"""
+                    <div style="color:var(--text); font-size:{loc_size}; font-weight:700; line-height:1.15; white-space:normal; overflow-wrap:anywhere;">
+                        {html.escape(loc_text)}
+                    </div>
+                    """,
+                    unsafe_allow_html=True
+                )
             c2.metric("Temp", f"{float(live_weather.get('Temperature', 0)):.1f}°")
             c3.metric("Humidity", f"{float(live_weather.get('Humidity', 0)):.1f}%")
             st.caption(f"Wind: {float(live_weather.get('WindSpeed', 0)):.2f} m/s")
@@ -474,6 +543,10 @@ with st.sidebar:
                 st.markdown(f"**You:** {chat['user']}")
                 st.markdown(f"**Lumina:** {chat['bot']}")
                 st.divider()
+
+effective_location_query = st.session_state.get("weather_query", "") or st.session_state.get("location", "")
+if effective_location_query == "Location unavailable":
+    effective_location_query = ""
     
 if compact_mode:
     st.markdown("""
@@ -501,6 +574,19 @@ if compact_mode:
 st.markdown("""
 <style>
 @media (max-width: 900px) {
+    [data-testid="block-container"] {
+        padding-left: 1rem !important;
+        padding-right: 1rem !important;
+    }
+    [data-testid="stHorizontalBlock"] {
+        display: flex !important;
+        flex-wrap: wrap !important;
+        gap: 0.75rem !important;
+    }
+    [data-testid="stHorizontalBlock"] > [data-testid="column"] {
+        min-width: calc(50% - 0.4rem) !important;
+        flex: 1 1 calc(50% - 0.4rem) !important;
+    }
     .metric-card {
         padding: 12px 10px !important;
     }
@@ -517,15 +603,24 @@ st.markdown("""
         font-size: 0.95rem !important;
     }
 }
+@media (max-width: 640px) {
+    [data-testid="stHorizontalBlock"] > [data-testid="column"] {
+        min-width: 100% !important;
+        flex: 1 1 100% !important;
+    }
+    .stButton button {
+        width: 100% !important;
+    }
+}
 </style>
 """, unsafe_allow_html=True)
 
 if st.session_state.get("quick_demo_mode", False) and not st.session_state.get("demo_bootstrapped", False):
     if 'live_history' not in st.session_state or st.session_state.live_history.empty:
         st.session_state.live_history = seed_demo_live_history(120)
-    if st.session_state.get("location"):
+    if effective_location_query:
         try:
-            demo_weather = get_weather_forecast(st.session_state.location, hours=24)
+            demo_weather = get_weather_forecast(effective_location_query, hours=24)
             demo_preds = predictor.predict_forecast(pd.Timestamp.now().ceil('H'), demo_weather, df)
             st.session_state.forecast_df = pd.DataFrame(demo_preds)
         except Exception:
@@ -854,12 +949,12 @@ with tab_prediction:
 
     behavior_mult = {"Conservative": 0.92, "Normal": 1.0, "Heavy": 1.12}
     if st.button("Generate Forecast", key="btn_forecast_pro", type="primary"):
-        if not city_name:
+        if not effective_location_query:
             st.warning("Location not detected. Please wait for GPS or enter a location.")
         else:
             with st.spinner("Running AI forecast..."):
                 try:
-                    forecast_weather = get_weather_forecast(city_name, hours=int(horizon))
+                    forecast_weather = get_weather_forecast(effective_location_query, hours=int(horizon))
                     for w in forecast_weather:
                         w['Temperature'] = float(w.get('Temperature', 25.0)) + temp_offset
                     now = pd.Timestamp.now()
@@ -1125,8 +1220,8 @@ with tab_advanced:
     if 'last_sim_result' not in st.session_state:
         st.session_state.last_sim_result = None
 
-    if city_name:
-        live_sim_weather = get_live_weather(city_name)
+    if effective_location_query:
+        live_sim_weather = get_live_weather_cached(effective_location_query)
         default_temp = float(live_sim_weather.get('Temperature', 25.0))
         default_hum = int(live_sim_weather.get('Humidity', 50))
     else:
@@ -1252,7 +1347,7 @@ with tab_solar:
         # Real-time Calculation
         # Ensure we have live weather (might be waiting for async location)
         if 'live_weather' not in locals():
-             live_weather = get_live_weather("London") # Fallback to prevent crash if not defined in scope
+             live_weather = get_live_weather_cached("London") # Fallback to prevent crash if not defined in scope
              
         current_solar_kw = solar_sim.calculate_instant_power(live_weather)
         

@@ -7,22 +7,89 @@ from datetime import datetime
 from geopy.geocoders import Nominatim
 import os
 
+def is_coordinate_query(value):
+    if not isinstance(value, str) or "," not in value:
+        return False
+    parts = [p.strip() for p in value.split(",")]
+    if len(parts) != 2:
+        return False
+    try:
+        float(parts[0])
+        float(parts[1])
+        return True
+    except (TypeError, ValueError):
+        return False
+
+def normalize_place_name(value):
+    if value is None:
+        return None
+    cleaned = " ".join(str(value).strip().split()).strip(",")
+    if not cleaned or is_coordinate_query(cleaned):
+        return None
+    return cleaned
+
+def pick_major_name_from_address(address):
+    if not isinstance(address, dict):
+        return None
+    # Keep this strict to avoid tiny/locality noise names.
+    for key in ("city", "town", "municipality"):
+        name = normalize_place_name(address.get(key))
+        if name:
+            return name
+    return None
+
+@st.cache_data(ttl=3600 * 12, show_spinner=False)
+def reverse_geocode_bigdatacloud(lat, lon):
+    """
+    Reverse geocode via BigDataCloud (no API key) as fallback when Nominatim rate-limits.
+    Returns a normalized city/town-style name when available.
+    """
+    try:
+        response = requests.get(
+            "https://api.bigdatacloud.net/data/reverse-geocode-client",
+            params={
+                "latitude": lat,
+                "longitude": lon,
+                "localityLanguage": "en",
+            },
+            timeout=6,
+        )
+        response.raise_for_status()
+        data = response.json()
+        for key in ("city", "locality", "principalSubdivision"):
+            name = normalize_place_name(data.get(key))
+            if name:
+                return name
+    except Exception:
+        return None
+    return None
+
+@st.cache_data(ttl=3600 * 12, show_spinner=False)
+def reverse_geocode_nominatim(lat, lon):
+    """
+    Reverse geocode with Nominatim. Cached to reduce external calls and avoid 509 bursts.
+    """
+    try:
+        geolocator = Nominatim(user_agent="lumina_energy_dashboard", timeout=10)
+        location = geolocator.reverse((lat, lon), zoom=10, language='en', addressdetails=True)
+        if location and 'address' in location.raw:
+            return pick_major_name_from_address(location.raw.get('address'))
+    except Exception:
+        return None
+    return None
+
 def get_major_city(lat, lon):
     """
     Resolve coordinates to the nearest major city using OpenStreetMap (Nominatim).
     Zoom=10 ensures we get 'city' level details, avoiding small villages.
     Returns: "City" or None
     """
-    try:
-        geolocator = Nominatim(user_agent="smart_home_controller")
-        # zoom=10 corresponds to city level
-        location = geolocator.reverse((lat, lon), zoom=10, language='en')
-        if location and 'address' in location.raw:
-            addr = location.raw['address']
-            # Prioritize City -> Town -> Village -> County
-            return addr.get('city') or addr.get('town') or addr.get('village') or addr.get('county')
-    except Exception as e:
-        print(f"Geopy reverse failed: {e}")
+    city = reverse_geocode_nominatim(lat, lon)
+    if city:
+        return city
+    city = reverse_geocode_bigdatacloud(lat, lon)
+    if city:
+        return city
     return None
 
 def get_weather_api_key():
@@ -98,7 +165,7 @@ def fetch_weather_from_weatherapi(location):
         # print(f"DEBUG: WeatherAPI Exception: {e}")
         return None
 
-@st.cache_data(ttl=600)
+@st.cache_data(ttl=600, show_spinner=False)
 def fetch_weather_from_wttr(location):
     """
     Fetch current weather from wttr.in (backup)
@@ -115,6 +182,11 @@ def fetch_weather_from_wttr(location):
         data = response.json()
         
         current = data['current_condition'][0]
+        nearest_area = data.get('nearest_area', [{}])[0]
+        area_name = nearest_area.get('areaName', [{}])[0].get('value', '')
+        region_name = nearest_area.get('region', [{}])[0].get('value', '')
+        country_name = nearest_area.get('country', [{}])[0].get('value', '')
+        location_name = area_name or region_name or country_name or 'Unknown Location'
         return {
             'Temperature': float(current['temp_C']),
             'Humidity': float(current['humidity']),
@@ -126,7 +198,7 @@ def fetch_weather_from_wttr(location):
             'Current': 2.0,
             'Frequency': 50.0,
             'source': 'wttr.in',
-            'LocationName': data.get('nearest_area', [{}])[0].get('areaName', [{}])[0].get('value', 'Unknown Location')
+            'LocationName': location_name
         }
     except Exception as e:
         return None
@@ -137,12 +209,12 @@ def resolve_coordinates(location_name):
     Resolve a city name to Lat,Lon using Nominatim
     """
     try:
-        geolocator = Nominatim(user_agent="smart_home_controller_resolution")
+        geolocator = Nominatim(user_agent="smart_home_controller_resolution", timeout=10)
         loc = geolocator.geocode(location_name)
         if loc:
             return f"{loc.latitude},{loc.longitude}"
-    except Exception as e:
-        print(f"Geocoding failed: {e}")
+    except Exception:
+        return None
     return None
 
 def get_live_weather(location):
@@ -157,9 +229,9 @@ def get_live_weather(location):
     if weather:
         return weather
     
-    # 2. Try Geocoding (If name unknown)
-    # If the location is already coords (digits), skip this
-    if not any(char.isdigit() for char in location):
+    # 2. Try Geocoding only when WeatherAPI key exists and location is textual.
+    # Without API key this path only adds failing geocoder calls.
+    if get_weather_api_key() and (not is_coordinate_query(str(location))):
         coords = resolve_coordinates(location)
         if coords:
             weather = fetch_weather_from_weatherapi(coords)
@@ -167,7 +239,8 @@ def get_live_weather(location):
                 return weather
     
     # 3. Try backup source (wttr.in) - often better at names
-    weather = fetch_weather_from_wttr(location.split(',')[0])
+    wttr_query = location if is_coordinate_query(str(location)) else str(location).split(',')[0]
+    weather = fetch_weather_from_wttr(wttr_query)
     if weather:
         return weather
     
