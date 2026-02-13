@@ -118,8 +118,9 @@ def detect_user_location():
         
         if data['status'] == 'success':
             loc = f"{data['city']}, {data['country']}"
-            print(f"DEBUG: Detected Location: {loc}")
-            return loc
+            tz = data.get('timezone', 'UTC')
+            print(f"DEBUG: Detected Location: {loc}, Timezone: {tz}")
+            return {'location': loc, 'timezone': tz}
         else:
             print(f"DEBUG: API returned failure status: {data.get('message', 'Unknown error')}")
     except Exception as e:
@@ -159,7 +160,8 @@ def fetch_weather_from_weatherapi(location):
             'Current': 2.0,
             'Frequency': 50.0,
             'source': 'WeatherAPI.com',
-            'LocationName': data['location']['name'] 
+            'LocationName': data['location']['name'],
+            'Timezone': data['location'].get('tz_id')
         }
     except Exception as e:
         # print(f"DEBUG: WeatherAPI Exception: {e}")

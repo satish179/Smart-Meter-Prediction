@@ -6,6 +6,7 @@ import datetime
 import os
 import csv
 import html
+import pytz
 
 # Custom Modules
 from src.inference_ceew import CEEWEnergyPredictor as EnergyPredictor
@@ -16,6 +17,44 @@ from src.anomaly import AnomalyDetector
 from src.virtual_meter import VirtualSmartMeter
 from src.solar import SolarSimulator
 from src.chatbot import EnergyChatbot
+import json
+
+# --- Persistence Helpers ---
+USER_CONFIG_FILE = "user_config.json"
+
+def load_user_config():
+    """Load last known location and settings."""
+    if os.path.exists(USER_CONFIG_FILE):
+        try:
+            with open(USER_CONFIG_FILE, "r") as f:
+                return json.load(f)
+        except Exception:
+            pass
+    return {}
+
+def save_user_config(location, timezone, query):
+    """Save valid location to persist across reloads."""
+    try:
+        data = {
+            "location": location,
+            "timezone": timezone,
+            "weather_query": query
+        }
+        with open(USER_CONFIG_FILE, "w") as f:
+            json.dump(data, f)
+    except Exception as e:
+        print(f"Failed to save config: {e}")
+
+# --- Helper for Local Time ---
+def get_local_now():
+    """Returns current time in user's detected timezone, or system time if not set."""
+    if 'timezone' in st.session_state and st.session_state.timezone:
+        try:
+            tz = pytz.timezone(st.session_state.timezone)
+            return datetime.datetime.now(tz)
+        except Exception:
+            pass
+    return datetime.datetime.now()
 
 # --- 1. Page Configuration & CSS ---
 st.set_page_config(
@@ -226,7 +265,7 @@ def location_font_size(place_name):
 
 def seed_demo_live_history(num_points=120):
     """Create lightweight synthetic live telemetry history for instant demo readiness."""
-    now = pd.Timestamp.now()
+    now = pd.Timestamp(get_local_now())
     times = pd.date_range(end=now, periods=num_points, freq='s')
     baseline = 0.35 + 0.08 * np.sin(np.linspace(0, 6 * np.pi, num_points))
     noise = np.random.normal(0, 0.02, size=num_points)
@@ -236,7 +275,13 @@ def seed_demo_live_history(num_points=120):
 def apply_quick_range(frame, quick_range, custom_range=None):
     if frame.empty:
         return frame.copy()
-    now = pd.Timestamp.now()
+    
+    now = pd.Timestamp(get_local_now())
+    # Ensure timezone compatibility
+    if frame.index.tz is None and now.tz is not None:
+        now = now.tz_localize(None)
+    elif frame.index.tz is not None and now.tz is None:
+        now = now.tz_localize(frame.index.tz)
     if quick_range == "24H":
         return frame.loc[frame.index >= (now - pd.Timedelta(hours=24))]
     if quick_range == "7D":
@@ -394,6 +439,7 @@ except Exception as e:
 # --- 3. Sidebar UI ---
 with st.sidebar:
     st.image("https://img.icons8.com/fluency/96/lightning-bolt.png", width=60)
+    
     st.title("Lumina")
     st.caption("Simple Energy Monitoring")
     st.divider()
@@ -418,6 +464,14 @@ with st.sidebar:
     if 'weather_query' not in st.session_state:
         st.session_state.weather_query = ""
 
+    # --- 1. Load Last Known Location on Startup ---
+    if not st.session_state.location:
+        saved_config = load_user_config()
+        if saved_config:
+            st.session_state.location = saved_config.get("location", "")
+            st.session_state.timezone = saved_config.get("timezone", "")
+            st.session_state.weather_query = saved_config.get("weather_query", "")
+
     # Legacy IP callback removed to enforce GPS
     def update_location_callback():
         pass 
@@ -432,15 +486,47 @@ with st.sidebar:
     if not st.session_state.quick_demo_mode:
         st.session_state.demo_bootstrapped = False
 
+    # RESET BUTTON
+    if st.button("Reset / Auto-Detect", help="Clear saved location and re-detect via IP"):
+        st.session_state.location = ""
+        st.session_state.last_geo_bucket = None
+        st.session_state.weather_query = ""
+        if os.path.exists(USER_CONFIG_FILE):
+             try:
+                 os.remove(USER_CONFIG_FILE)
+             except Exception:
+                 pass
+        st.rerun()
+
+    # Fallback to IP-based location REMOVED as per user request (strict sensor only)
+    # if not st.session_state.location ...
+
     st.markdown("**Location**")
     fetch_location_clicked = False
+    
+    # ... (rest of location code) ...
+    
+
+
+    
+
+
+
 
     col_loc1, col_loc2 = st.columns([4, 1])
     with col_loc2:
+        # Dynamic key for geolocation to force re-render/re-request
+        if 'geo_key' not in st.session_state:
+            st.session_state.geo_key = 0
+
         fetch_location_clicked = st.button("Fetch", help="Fetch location from GPS")
+        if fetch_location_clicked:
+            st.session_state.geo_key += 1
+            st.rerun()
 
     # Enforce Precise Location (GPS)
-    geo_data = get_geolocation()
+    # Using a unique key forces the component to remount, triggering a fresh permission request
+    geo_data = get_geolocation(component_key=f"geo_{st.session_state.geo_key}")
     if geo_data and 'coords' in geo_data:
         lat = geo_data['coords']['latitude']
         lon = geo_data['coords']['longitude']
@@ -463,14 +549,66 @@ with st.sidebar:
                     provider_name = str(weather_probe.get("LocationName", "")).strip()
                     if provider_name and not is_coordinate_string(provider_name):
                         st.session_state.location = provider_name
+                        
+                        # SAVE CONFIG on successful GPS resolve
+                        save_user_config(
+                            location=st.session_state.location,
+                            timezone=st.session_state.get("timezone", ""),
+                            query=coord_string
+                        )
                     elif not st.session_state.location:
-                        st.session_state.location = "Location unavailable"
+                         # Last Resort: IP-based detection if even the provider lookup failed
+                         try:
+                             ip_loc = detect_user_location()
+                             if ip_loc:
+                                 if isinstance(ip_loc, dict):
+                                     st.session_state.location = ip_loc['location']
+                                     st.session_state.timezone = ip_loc['timezone']
+                                     st.session_state.weather_query = ip_loc['location']
+                                 else:
+                                     st.session_state.location = ip_loc
+                                     st.session_state.weather_query = ip_loc
+                         except Exception:
+                             st.session_state.location = "Location unavailable"
             st.rerun()
+    
+    # If no GPS data (yet or denied), try IP fallback ONE time if location is still empty
+    if not geo_data and not st.session_state.location and not st.session_state.get("quick_demo_mode", False):
+         # Avoid spamming the API on every rerun, check if we already tried? 
+         # Simpler: just try once if location is empty.
+         try:
+             # Only try if we haven't manually set it to "Location unavailable" to avoid loops
+             if st.session_state.get('last_geo_bucket') is None: 
+                ip_loc = detect_user_location()
+                if ip_loc:
+                    if isinstance(ip_loc, dict):
+                        st.session_state.location = ip_loc['location']
+                        st.session_state.timezone = ip_loc['timezone']
+                        st.session_state.weather_query = ip_loc['location']
+                    else:
+                        st.session_state.location = ip_loc
+                        st.session_state.weather_query = ip_loc
+                    st.rerun()
+         except Exception:
+             pass
 
     with col_loc1:
         city_name = st.text_input("Region Name", key="location", label_visibility="collapsed")
-        if city_name and not is_coordinate_string(city_name) and city_name != "Location unavailable":
-            st.session_state.weather_query = city_name
+        # Fix: Do NOT overwrite precise GPS coordinates with the city name for the weather query.
+        # Only use the text input as the query if:
+        # 1. We don't have a valid coordinate query yet, OR
+        # 2. The user manually typed something different from the auto-detected location.
+        location_is_auto = st.session_state.get('last_geo_bucket') and not is_coordinate_string(city_name)
+        if not location_is_auto:
+             if city_name and not is_coordinate_string(city_name) and city_name != "Location unavailable":
+                st.session_state.weather_query = city_name
+                # Persist manual entry
+                save_user_config(
+                    location=city_name,
+                    timezone=st.session_state.get("timezone", ""),
+                    query=city_name
+                )
+                st.session_state.weather_query = city_name
     
 
 
@@ -480,6 +618,9 @@ with st.sidebar:
             weather_query = st.session_state.get("weather_query", "") or city_name
             if weather_query:
                 live_weather = get_live_weather_cached(weather_query)
+                # Update timezone if available from weather data (e.g. for GPS users)
+                if live_weather and 'Timezone' in live_weather and live_weather['Timezone']:
+                    st.session_state.timezone = live_weather['Timezone']
                 resolved_name = live_weather.get(
                     "LocationName",
                     st.session_state.get("location") or city_name or "Location unavailable"
@@ -506,11 +647,26 @@ with st.sidebar:
             with c1:
                 loc_text = str(resolved_name or "Location unavailable")
                 loc_size = location_font_size(loc_text)
+                
+                # Determine Source Label
+                if st.session_state.get('last_geo_bucket'):
+                    source_label = "📍 GPS (Precise)"
+                    source_color = "var(--ok)"
+                elif loc_text != "Location unavailable" and loc_text != "Waiting...":
+                    source_label = "🌐 Network (Approx)"
+                    source_color = "var(--warn)"
+                else:
+                    source_label = "❓ Unknown"
+                    source_color = "var(--muted)"
+
                 st.markdown("**Location**")
                 st.markdown(
                     f"""
                     <div style="color:var(--text); font-size:{loc_size}; font-weight:700; line-height:1.15; white-space:normal; overflow-wrap:anywhere;">
                         {html.escape(loc_text)}
+                    </div>
+                    <div style="color:{source_color}; font-size:0.75rem; margin-top:4px; font-weight:600;">
+                        {source_label}
                     </div>
                     """,
                     unsafe_allow_html=True
@@ -631,13 +787,32 @@ if st.session_state.get("quick_demo_mode", False):
 
 
 # --- 4. Main Dashboard Header ---
-st.markdown(
-    f"""
-    <div class='hero-title'>Energy Dashboard</div>
-    <div class='hero-sub'>Overview for <b>{datetime.datetime.now().strftime('%B %Y')}</b> • AI Forecast + Live Telemetry</div>
-    """,
-    unsafe_allow_html=True
-)
+# --- 4. Main Dashboard Header ---
+head_c1, head_c2 = st.columns([3, 1])
+
+with head_c1:
+    st.markdown(
+        f"""
+        <div class='hero-title'>Energy Dashboard</div>
+        <div class='hero-sub'>Overview for <b>{datetime.datetime.now().strftime('%B %Y')}</b> • AI Forecast + Live Telemetry</div>
+        """,
+        unsafe_allow_html=True
+    )
+
+with head_c2:
+    # LIVE CLOCK - Synced to User/Internet Time
+    local_time = get_local_now()
+    time_str = local_time.strftime("%I:%M %p")
+    date_str = local_time.strftime("%b %d, %Y")
+    tz_label = st.session_state.get('timezone', 'Local')
+    
+    st.markdown(f"""
+    <div style="background: rgba(255,255,255,0.05); padding: 10px; border-radius: 8px; text-align: center; border: 1px solid var(--stroke);">
+        <div style="font-size: 1.5rem; font-weight: 800; color: var(--accent); line-height: 1;">{time_str}</div>
+        <div style="font-size: 0.8rem; color: var(--muted); margin-top: 4px;">{date_str}</div>
+        <div style="font-size: 0.7rem; color: #6b7280; margin-top: 2px;">📍 {tz_label}</div>
+    </div>
+    """, unsafe_allow_html=True)
 
 
 # Date logic
@@ -1108,62 +1283,34 @@ with tab_live:
             help="Maximum points kept in the live chart window. Higher = longer history, but heavier rendering."
         )
     
-    if st.toggle("Enable Real-Time Telemetry", key="live_monitor_active", value=False):
-        if 'live_history' not in st.session_state:
-            st.session_state.live_history = pd.DataFrame(columns=['Time', 'Power'])
-        if 'last_live_data' not in st.session_state:
-            st.session_state.last_live_data = None
+    
+    # --- REAL-TIME CHARTING & LOGIC ---
+    chart_placeholder = st.empty()
+    metric_placeholder = st.empty()
+    
+    # 1. VISUALIZATION (Must run BEFORE the rerun loop)
+    if st.session_state.get("live_monitor_active"):
+        with chart_placeholder.container():
+            if 'live_history' in st.session_state and not st.session_state.live_history.empty:
+                live_chart = alt.Chart(st.session_state.live_history).mark_area(
+                    line={'color':'#10b981'},
+                    color=alt.Gradient(
+                        gradient='linear',
+                        stops=[alt.GradientStop(color='#10b981', offset=0),
+                               alt.GradientStop(color='rgba(16, 185, 129, 0.1)', offset=1)],
+                        x1=1, x2=1, y1=1, y2=0
+                    )
+                ).encode(
+                    x=alt.X('Time:T', axis=alt.Axis(format='%H:%M:%S', title=None)),
+                    y=alt.Y('Power:Q', scale=alt.Scale(domain=[0, 8]), title=None),
+                ).properties(height=250, title="Live Power (kW)")
+                st.altair_chart(live_chart, use_container_width=True)
+            else:
+                st.info("Start telemetry to generate live chart data.")
 
-        # Non-blocking telemetry: process a burst per rerun (no sleep/rerun loop),
-        # so other tabs stay interactive while live mode is on.
-        for _ in range(int(samples_per_burst)):
-            data = st.session_state.virtual_meter.generate_reading()
-            now = datetime.datetime.now()
-            try:
-                row = {k: data.get(k) for k in LIVE_LOG_COLUMNS}
-                pd.DataFrame([row], columns=LIVE_LOG_COLUMNS).to_csv(
-                    LIVE_LOG_PATH,
-                    mode='a',
-                    header=not os.path.exists(LIVE_LOG_PATH),
-                    index=False
-                )
-            except Exception:
-                pass
-
-            new_row = pd.DataFrame({'Time': [now], 'Power': [data['power_kw']]})
-            st.session_state.live_history = pd.concat([st.session_state.live_history, new_row]).tail(max_points)
-            st.session_state.last_live_data = data
-
-            alert = st.session_state.anomaly_detector.check_anamoly(now, data['power_kw'])
-            if alert:
-                st.toast(alert, icon="🚨")
-                st.session_state.alerts.insert(0, f"{now.strftime('%H:%M:%S')}: {alert}")
-        st.caption(
-            f"Live telemetry running in non-blocking mode. "
-            f"Collecting {int(samples_per_burst)} samples per app update "
-            f"(target cadence {refresh_interval:.1f}s)."
-        )
-
-    with chart_placeholder.container():
-        if 'live_history' in st.session_state and not st.session_state.live_history.empty:
-            live_chart = alt.Chart(st.session_state.live_history).mark_area(
-                line={'color':'#10b981'},
-                color=alt.Gradient(
-                    gradient='linear',
-                    stops=[alt.GradientStop(color='#10b981', offset=0),
-                           alt.GradientStop(color='rgba(16, 185, 129, 0.1)', offset=1)],
-                    x1=1, x2=1, y1=1, y2=0
-                )
-            ).encode(
-                x=alt.X('Time:T', axis=alt.Axis(format='%H:%M:%S', title=None)),
-                y=alt.Y('Power:Q', scale=alt.Scale(domain=[0, 8]), title=None),
-            ).properties(height=250, title="Live Power (kW)")
-            st.altair_chart(live_chart, use_container_width=True)
-        else:
-            st.info("Start telemetry to generate live chart data.")
-
-    with metric_placeholder.container():
-        data = st.session_state.get('last_live_data')
+    if st.session_state.get("live_monitor_active"):
+        with metric_placeholder.container():
+            data = st.session_state.get('last_live_data')
         m1, m2, m3, m4 = st.columns(4)
         if data:
             m1.metric("Power", f"{data['power_kw']:.2f} kW")
@@ -1181,6 +1328,46 @@ with tab_live:
                 for a in st.session_state.alerts[:3]:
                     st.write(a)
 
+    # 2. CONTROL LOOP
+    if st.toggle("Enable Real-Time Telemetry", key="live_monitor_active"):
+        if 'live_history' not in st.session_state:
+            st.session_state.live_history = seed_demo_live_history(60)
+        if 'last_live_data' not in st.session_state:
+            st.session_state.last_live_data = None
+            
+        import time
+        time.sleep(refresh_interval)
+        
+        # Burst Processing
+        for _ in range(int(samples_per_burst)):
+            data = st.session_state.virtual_meter.generate_reading()
+            now = pd.Timestamp(get_local_now())
+            
+            # Log to CSV
+            try:
+                row = {k: data.get(k) for k in LIVE_LOG_COLUMNS}
+                pd.DataFrame([row], columns=LIVE_LOG_COLUMNS).to_csv(
+                    LIVE_LOG_PATH,
+                    mode='a',
+                    header=not os.path.exists(LIVE_LOG_PATH),
+                    index=False
+                )
+            except Exception:
+                pass
+
+            # Update State
+            new_row = pd.DataFrame({'Time': [now], 'Power': [data['power_kw']]})
+            st.session_state.live_history = pd.concat([st.session_state.live_history, new_row]).tail(max_points)
+            st.session_state.last_live_data = data
+
+            # Anomaly Check
+            alert = st.session_state.anomaly_detector.check_anamoly(now, data['power_kw'])
+            if alert:
+                st.toast(alert, icon="🚨")
+                st.session_state.alerts.insert(0, f"{now.strftime('%H:%M:%S')}: {alert}")
+        
+        st.rerun()
+    
     st.divider()
     st.markdown("#### Export Data")
     live_export_df = pd.DataFrame()
