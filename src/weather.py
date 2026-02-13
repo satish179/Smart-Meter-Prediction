@@ -108,23 +108,39 @@ def detect_user_location():
     Auto-detect user location based on IP address
     Returns: "City, Country" or None
     """
-    print("DEBUG: Attempting to detect location via ip-api.com...")
+    print("DEBUG: Attempting to detect location via IP geolocation providers...")
+
+    # Provider 1 (HTTPS): ipapi.co
+    try:
+        response = requests.get('https://ipapi.co/json/', timeout=5)
+        print(f"DEBUG: ipapi.co status: {response.status_code}")
+        data = response.json()
+        city = str(data.get('city', '')).strip()
+        country = str(data.get('country_name', '')).strip()
+        timezone = str(data.get('timezone', 'UTC')).strip() or "UTC"
+        if city and country:
+            loc = f"{city}, {country}"
+            print(f"DEBUG: ipapi.co detected: {loc}, timezone: {timezone}")
+            return {'location': loc, 'timezone': timezone}
+    except Exception as e:
+        print(f"DEBUG: ipapi.co failed: {e}")
+
+    # Provider 2 (fallback): ip-api.com (HTTP)
     try:
         response = requests.get('http://ip-api.com/json', timeout=5)
-        print(f"DEBUG: API Response Code: {response.status_code}")
-        
+        print(f"DEBUG: ip-api.com status: {response.status_code}")
         data = response.json()
-        print(f"DEBUG: API Data: {data}")
-        
-        if data['status'] == 'success':
-            loc = f"{data['city']}, {data['country']}"
-            tz = data.get('timezone', 'UTC')
-            print(f"DEBUG: Detected Location: {loc}, Timezone: {tz}")
-            return {'location': loc, 'timezone': tz}
-        else:
-            print(f"DEBUG: API returned failure status: {data.get('message', 'Unknown error')}")
+        if data.get('status') == 'success':
+            city = str(data.get('city', '')).strip()
+            country = str(data.get('country', '')).strip()
+            timezone = str(data.get('timezone', 'UTC')).strip() or "UTC"
+            if city and country:
+                loc = f"{city}, {country}"
+                print(f"DEBUG: ip-api.com detected: {loc}, timezone: {timezone}")
+                return {'location': loc, 'timezone': timezone}
     except Exception as e:
-        print(f"DEBUG: Location detection failed with exception: {e}")
+        print(f"DEBUG: ip-api.com failed: {e}")
+
     return None
 
 

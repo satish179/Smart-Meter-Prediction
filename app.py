@@ -11,8 +11,8 @@ import pytz
 # Custom Modules
 from src.inference_ceew import CEEWEnergyPredictor as EnergyPredictor
 from src.preprocessing_ceew import load_and_preprocess_ceew_data as load_and_preprocess_data
-from src.weather import get_live_weather, get_weather_forecast, detect_user_location, get_major_city
-from streamlit_js_eval import get_geolocation
+from src.weather import get_live_weather, get_weather_forecast, get_major_city
+from streamlit_js_eval import streamlit_js_eval
 from src.anomaly import AnomalyDetector
 from src.virtual_meter import VirtualSmartMeter
 from src.solar import SolarSimulator
@@ -32,13 +32,14 @@ def load_user_config():
             pass
     return {}
 
-def save_user_config(location, timezone, query):
+def save_user_config(location, timezone, query, source="manual"):
     """Save valid location to persist across reloads."""
     try:
         data = {
             "location": location,
             "timezone": timezone,
-            "weather_query": query
+            "weather_query": query,
+            "source": source
         }
         with open(USER_CONFIG_FILE, "w") as f:
             json.dump(data, f)
@@ -238,6 +239,40 @@ def hour_label(hour_value):
 @st.cache_data(ttl=120, show_spinner=False)
 def get_live_weather_cached(location):
     return get_live_weather(location)
+
+def get_precise_geolocation(component_key):
+    """
+    Request browser geolocation with strict options for better accuracy.
+    """
+    js_text = """
+    new Promise((resolve) => {
+      if (!navigator.geolocation) {
+        resolve({ error: { code: 0, message: "Browser does not support geolocation!" } });
+        return;
+      }
+      navigator.geolocation.getCurrentPosition(
+        (position) => {
+          resolve({
+            coords: {
+              accuracy: position.coords.accuracy,
+              altitude: position.coords.altitude,
+              altitudeAccuracy: position.coords.altitudeAccuracy,
+              heading: position.coords.heading,
+              latitude: position.coords.latitude,
+              longitude: position.coords.longitude,
+              speed: position.coords.speed
+            },
+            timestamp: position.timestamp
+          });
+        },
+        (error) => {
+          resolve({ error: { code: error.code, message: error.message } });
+        },
+        { enableHighAccuracy: true, timeout: 15000, maximumAge: 0 }
+      );
+    })
+    """
+    return streamlit_js_eval(js_expressions=js_text, key=component_key)
 
 def is_coordinate_string(value):
     if not isinstance(value, str) or "," not in value:
@@ -463,18 +498,30 @@ with st.sidebar:
         st.session_state.last_geo_bucket = None
     if 'weather_query' not in st.session_state:
         st.session_state.weather_query = ""
+    if 'geo_fetch_requested' not in st.session_state:
+        st.session_state.geo_fetch_requested = False
+    if 'manual_location_override' not in st.session_state:
+        st.session_state.manual_location_override = False
 
     # --- 1. Load Last Known Location on Startup ---
     if not st.session_state.location:
         saved_config = load_user_config()
         if saved_config:
-            st.session_state.location = saved_config.get("location", "")
+            saved_location = saved_config.get("location", "")
+            saved_query = saved_config.get("weather_query", "")
+            saved_source = saved_config.get("source", "")
+            if saved_source not in {"gps", "manual"}:
+                # Ignore legacy entries that were stored before source tracking.
+                saved_location = ""
+                saved_query = ""
+            st.session_state.location = saved_location
             st.session_state.timezone = saved_config.get("timezone", "")
-            st.session_state.weather_query = saved_config.get("weather_query", "")
-
-    # Legacy IP callback removed to enforce GPS
-    def update_location_callback():
-        pass 
+            st.session_state.weather_query = saved_query
+            st.session_state.manual_location_override = (saved_source == "manual")
+            if saved_source == "gps" and is_coordinate_string(str(saved_query)):
+                st.session_state.last_geo_coords = saved_query
+                parts = [p.strip() for p in str(saved_query).split(",")]
+                st.session_state.last_geo_bucket = f"{float(parts[0]):.3f},{float(parts[1]):.3f}"
 
     st.session_state.quick_demo_mode = st.toggle(
         "Demo Mode",
@@ -487,10 +534,13 @@ with st.sidebar:
         st.session_state.demo_bootstrapped = False
 
     # RESET BUTTON
-    if st.button("Reset / Auto-Detect", help="Clear saved location and re-detect via IP"):
+    if st.button("Reset Location", help="Clear saved location and fetch fresh GPS coordinates"):
         st.session_state.location = ""
         st.session_state.last_geo_bucket = None
+        st.session_state.last_geo_coords = None
         st.session_state.weather_query = ""
+        st.session_state.geo_fetch_requested = False
+        st.session_state.manual_location_override = False
         if os.path.exists(USER_CONFIG_FILE):
              try:
                  os.remove(USER_CONFIG_FILE)
@@ -498,21 +548,7 @@ with st.sidebar:
                  pass
         st.rerun()
 
-    # Fallback to IP-based location REMOVED as per user request (strict sensor only)
-    # if not st.session_state.location ...
-
     st.markdown("**Location**")
-    fetch_location_clicked = False
-    
-    # ... (rest of location code) ...
-    
-
-
-    
-
-
-
-
     col_loc1, col_loc2 = st.columns([4, 1])
     with col_loc2:
         # Dynamic key for geolocation to force re-render/re-request
@@ -521,28 +557,42 @@ with st.sidebar:
 
         fetch_location_clicked = st.button("Fetch", help="Fetch location from GPS")
         if fetch_location_clicked:
+            st.session_state.geo_fetch_requested = True
             st.session_state.geo_key += 1
             st.rerun()
 
     # Enforce Precise Location (GPS)
     # Using a unique key forces the component to remount, triggering a fresh permission request
-    geo_data = get_geolocation(component_key=f"geo_{st.session_state.geo_key}")
+    geo_data = get_precise_geolocation(component_key=f"geo_{st.session_state.geo_key}")
+    geo_error = None
+    geo_accuracy_m = None
+    if isinstance(geo_data, dict) and geo_data.get("error"):
+        geo_error = str(geo_data.get("error")).strip()
     if geo_data and 'coords' in geo_data:
         lat = geo_data['coords']['latitude']
         lon = geo_data['coords']['longitude']
+        geo_accuracy_m = geo_data['coords'].get('accuracy')
         coord_string = f"{lat:.5f},{lon:.5f}"
         coord_bucket = f"{lat:.3f},{lon:.3f}"
         st.session_state.weather_query = coord_string
 
-        should_resolve = fetch_location_clicked or (st.session_state.last_geo_bucket != coord_bucket)
+        should_resolve = st.session_state.get('geo_fetch_requested', False) or (st.session_state.last_geo_bucket != coord_bucket)
         if should_resolve:
             st.session_state.last_geo_coords = coord_string
             st.session_state.last_geo_bucket = coord_bucket
+            st.session_state.geo_fetch_requested = False
+            st.session_state.manual_location_override = False
             # Resolve using geopy to get Major City
             with st.spinner("Finding nearest major city..."):
                 city = get_major_city(lat, lon)
                 if city and str(city).strip():
                     st.session_state.location = str(city).strip()
+                    save_user_config(
+                        location=st.session_state.location,
+                        timezone=st.session_state.get("timezone", ""),
+                        query=coord_string,
+                        source="gps"
+                    )
                 if not st.session_state.location or is_coordinate_string(st.session_state.location):
                     # Fallback: derive a human-readable location from weather provider.
                     weather_probe = get_live_weather_cached(coord_string)
@@ -554,61 +604,38 @@ with st.sidebar:
                         save_user_config(
                             location=st.session_state.location,
                             timezone=st.session_state.get("timezone", ""),
-                            query=coord_string
+                            query=coord_string,
+                            source="gps"
                         )
-                    elif not st.session_state.location:
-                         # Last Resort: IP-based detection if even the provider lookup failed
-                         try:
-                             ip_loc = detect_user_location()
-                             if ip_loc:
-                                 if isinstance(ip_loc, dict):
-                                     st.session_state.location = ip_loc['location']
-                                     st.session_state.timezone = ip_loc['timezone']
-                                     st.session_state.weather_query = ip_loc['location']
-                                 else:
-                                     st.session_state.location = ip_loc
-                                     st.session_state.weather_query = ip_loc
-                         except Exception:
-                             st.session_state.location = "Location unavailable"
             st.rerun()
-    
-    # If no GPS data (yet or denied), try IP fallback ONE time if location is still empty
-    if not geo_data and not st.session_state.location and not st.session_state.get("quick_demo_mode", False):
-         # Avoid spamming the API on every rerun, check if we already tried? 
-         # Simpler: just try once if location is empty.
-         try:
-             # Only try if we haven't manually set it to "Location unavailable" to avoid loops
-             if st.session_state.get('last_geo_bucket') is None: 
-                ip_loc = detect_user_location()
-                if ip_loc:
-                    if isinstance(ip_loc, dict):
-                        st.session_state.location = ip_loc['location']
-                        st.session_state.timezone = ip_loc['timezone']
-                        st.session_state.weather_query = ip_loc['location']
-                    else:
-                        st.session_state.location = ip_loc
-                        st.session_state.weather_query = ip_loc
-                    st.rerun()
-         except Exception:
-             pass
 
     with col_loc1:
-        city_name = st.text_input("Region Name", key="location", label_visibility="collapsed")
-        # Fix: Do NOT overwrite precise GPS coordinates with the city name for the weather query.
-        # Only use the text input as the query if:
-        # 1. We don't have a valid coordinate query yet, OR
-        # 2. The user manually typed something different from the auto-detected location.
-        location_is_auto = st.session_state.get('last_geo_bucket') and not is_coordinate_string(city_name)
-        if not location_is_auto:
-             if city_name and not is_coordinate_string(city_name) and city_name != "Location unavailable":
-                st.session_state.weather_query = city_name
-                # Persist manual entry
+        def on_location_change():
+            typed_value = str(st.session_state.get("location", "")).strip()
+            if typed_value and not is_coordinate_string(typed_value) and typed_value != "Location unavailable":
+                st.session_state.manual_location_override = True
+                st.session_state.weather_query = typed_value
                 save_user_config(
-                    location=city_name,
+                    location=typed_value,
                     timezone=st.session_state.get("timezone", ""),
-                    query=city_name
+                    query=typed_value,
+                    source="manual"
                 )
-                st.session_state.weather_query = city_name
+
+        city_name = st.text_input(
+            "Region Name",
+            key="location",
+            label_visibility="collapsed",
+            on_change=on_location_change
+        )
+
+        if (
+            st.session_state.get("manual_location_override", False)
+            and city_name
+            and not is_coordinate_string(city_name)
+            and city_name != "Location unavailable"
+        ):
+            st.session_state.weather_query = city_name
     
 
 
@@ -641,7 +668,18 @@ with st.sidebar:
                     "LocationName": "Waiting...",
                 }
                 resolved_name = "Waiting..."
-                st.info("Waiting for location details...")
+                st.info("Waiting for GPS. Click Fetch and allow location access, or type your location manually.")
+                if geo_error:
+                    st.warning(f"GPS unavailable: {geo_error}. You can click Fetch again or type a location.")
+            if geo_accuracy_m is not None:
+                try:
+                    if float(geo_accuracy_m) > 3000:
+                        st.warning(
+                            f"Low GPS accuracy (~{int(float(geo_accuracy_m))} m). "
+                            "Turn on high-accuracy location on your device/browser for better precision."
+                        )
+                except Exception:
+                    pass
 
             c1, c2, c3 = st.columns(3)
             with c1:
@@ -652,8 +690,11 @@ with st.sidebar:
                 if st.session_state.get('last_geo_bucket'):
                     source_label = "📍 GPS (Precise)"
                     source_color = "var(--ok)"
+                elif st.session_state.get("manual_location_override", False):
+                    source_label = "⌨️ Manual"
+                    source_color = "var(--accent)"
                 elif loc_text != "Location unavailable" and loc_text != "Waiting...":
-                    source_label = "🌐 Network (Approx)"
+                    source_label = "⚠️ Unverified"
                     source_color = "var(--warn)"
                 else:
                     source_label = "❓ Unknown"
@@ -1594,4 +1635,3 @@ with tab_solar:
     st.divider()
     
 st.caption("© 2026 Lumina. All rights reserved.")
-
